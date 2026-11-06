@@ -1,0 +1,126 @@
+[package]
+name = "clash-zhengl"
+version = "0.1.0"
+description = "Clash Zhengl — 轻量级 Windows 代理客户端"
+authors = ["myxiaolizi <my@zhengl.vip>"]
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+repository = "https://github.com/myxiaolizi/clash"
+default-run = "clash-zhengl"
+
+# 二进制名固定为 clash-zhengl.exe（C.1）
+[[bin]]
+name = "clash-zhengl"
+path = "src/main.rs"
+
+[lib]
+name = "clash_zhengl_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ---------- Tauri ----------
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+# ---------- 序列化 ----------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+# ---------- 异步运行时（单线程，见 02 章 ADR-02） ----------
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "time",
+    "sync",
+    "macros",
+    "fs",
+    "io-util",
+    "process",
+] }
+
+# ---------- HTTP（rustls，不引入 OpenSSL 依赖） ----------
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "stream",
+    "charset",
+    "http2",
+    "json",
+] }
+
+# ---------- 压缩（内核 zip 解包） ----------
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# ---------- 日志 ----------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "local-time",
+] }
+tracing-appender = "0.2"
+
+# ---------- Windows API ----------
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_Networking_WinInet",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
+] }
+
+# ---------- 工具 ----------
+# 用 regex-lite 而非 regex：体积小约 3 倍，本项目只需简单字面匹配
+regex-lite = "0.1"
+thiserror = "2"
+anyhow = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+url = "2"
+rand = "0.8"
+once_cell = "1"
+parking_lot = "0.12"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+semver = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+# ---------- 开发依赖 ----------
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+
+# ---------- 构建配置：轻量化（见 10 章） ----------
+[profile.release]
+opt-level = "z"      # 体积优先
+lto = true           # 链接期优化，显著减小体积
+codegen-units = 1    # 单编译单元，配合 LTO 效果最好
+panic = "abort"      # 去掉 unwind 表，减小体积
+strip = true         # 去掉符号表
+incremental = false
+
+[profile.dev]
+opt-level = 0
+debug = 1            # 只要行号，不要完整调试信息，减小磁盘占用
+
+# 依赖在 dev 下也用 -O1，避免 debug 版启动慢到无法测性能
+[profile.dev.package."*"]
+opt-level = 1

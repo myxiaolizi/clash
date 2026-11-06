@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Clash Zhengl</title>
+    <link rel="stylesheet" href="./ui/styles.css" />
+  </head>
+  <body>
+    <!-- 自绘标题栏（tauri.conf.json decorations:false） -->
+    <header id="titlebar" data-tauri-drag-region>
+      <div class="tb-left" data-tauri-drag-region>
+        <span class="tb-logo" aria-hidden="true"></span>
+        <span class="tb-title">Clash Zhengl</span>
+        <span id="tb-status" class="tb-status" title="内核状态">未启动</span>
+      </div>
+      <div class="tb-right">
+        <button id="btn-min" class="tb-btn" title="最小化" aria-label="最小化">
+          <svg viewBox="0 0 10 10"><path d="M2 5h6" /></svg>
+        </button>
+        <button id="btn-max" class="tb-btn" title="最大化" aria-label="最大化">
+          <svg viewBox="0 0 10 10"><rect x="2" y="2" width="6" height="6" /></svg>
+        </button>
+        <button id="btn-close" class="tb-btn tb-close" title="关闭" aria-label="关闭">
+          <svg viewBox="0 0 10 10"><path d="M2 2l6 6M8 2l-6 6" /></svg>
+        </button>
+      </div>
+    </header>
+
+    <main id="app">
+      <!-- 侧栏导航 -->
+      <nav id="sidenav" aria-label="主导航">
+        <button class="nav-item active" data-view="subscriptions">
+          <span class="nav-ico" aria-hidden="true">☰</span><span>订阅</span>
+        </button>
+        <button class="nav-item" data-view="traffic">
+          <span class="nav-ico" aria-hidden="true">◔</span><span>流量</span>
+        </button>
+        <button class="nav-item" data-view="nodes">
+          <span class="nav-ico" aria-hidden="true">⚡</span><span>节点</span>
+        </button>
+        <button class="nav-item" data-view="settings">
+          <span class="nav-ico" aria-hidden="true">⚙</span><span>设置</span>
+        </button>
+      </nav>
+
+      <!-- 内容区 -->
+      <section id="content">
+        <div id="view-subscriptions" class="view active"></div>
+        <div id="view-traffic" class="view"></div>
+        <div id="view-nodes" class="view"></div>
+        <div id="view-settings" class="view"></div>
+      </section>
+    </main>
+
+    <!-- 底部状态栏 -->
+    <footer id="statusbar">
+      <span id="sb-core">内核：未启动</span>
+      <span id="sb-proxy">系统代理：关闭</span>
+      <span id="sb-traffic" class="sb-right">↑ 0 B/s  ↓ 0 B/s</span>
+    </footer>
+
+    <!-- 全局对话框（合规提示 / 错误详情 / 确认） -->
+    <div id="modal-root"></div>
+    <!-- 轻提示 -->
+    <div id="toast-root" aria-live="polite"></div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

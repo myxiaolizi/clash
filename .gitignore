@@ -1,0 +1,29 @@
+# ---- Rust / Tauri ----
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ---- Node / 前端 ----
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# ---- 构建与日志产物 ----
+cargo-check.log
+*.log
+
+# ---- 本地测试用的临时服务（mock 订阅、CDP 脚本）----
+tmp-test/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 运行时敏感数据（绝不入库）----
+# DPAPI 加密后的订阅 URL / secret、日志、内核二进制
+*.secret
+secret
+runtime/
