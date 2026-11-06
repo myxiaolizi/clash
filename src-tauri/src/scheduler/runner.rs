@@ -20,8 +20,12 @@ use crate::scheduler::clock::next_wake_delay;
 use crate::scheduler::due::PeriodicTask;
 use crate::speedtest::SpeedtestEngine;
 use crate::store::settings_store::SettingsStore;
+use crate::store::traffic_store::TrafficStore;
 use crate::subscription::SubscriptionManager;
 use crate::util::time::now_secs;
+
+/// 流量采集周期（秒）。60 秒足够画趋势图，又不会把内核 API 打满。
+pub const TRAFFIC_COLLECT_INTERVAL_SEC: u32 = 1;
 
 /// 调度事件（推给 UI）
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,17 +36,28 @@ pub struct SchedulerEvent {
     pub at: i64,
 }
 
+/// 采集周期下限：1 分钟一次即可。
+///
+/// `PeriodicTask.period_min` 的单位是**分钟**，而 `TRAFFIC_COLLECT_INTERVAL_SEC`
+/// 表达的是秒 —— 这里必须显式说明，否则容易误写成 60 分钟。
+pub const TRAFFIC_COLLECT_PERIOD_MIN: u32 = 1;
+
 /// 调度器
 pub struct Scheduler {
     subs: Arc<SubscriptionManager>,
     settings: Arc<SettingsStore>,
     kernel: Arc<KernelSupervisor>,
     speedtest: Arc<SpeedtestEngine>,
+    traffic: Arc<TrafficStore>,
+    /// 内核 API（流量采集需要；内核未就绪时为 None）
+    api: parking_lot::RwLock<Option<Arc<dyn crate::kernel::SelectorApi>>>,
     events: broadcast::Sender<SchedulerEvent>,
     /// 订阅拉取任务状态
     sub_task: parking_lot::Mutex<PeriodicTask>,
     /// 测速任务状态
     speed_task: parking_lot::Mutex<PeriodicTask>,
+    /// 流量采集任务状态
+    traffic_task: parking_lot::Mutex<PeriodicTask>,
     /// 订阅失败退避
     sub_backoff: parking_lot::Mutex<Backoff>,
     /// 停止标志
@@ -55,6 +70,7 @@ impl Scheduler {
         settings: Arc<SettingsStore>,
         kernel: Arc<KernelSupervisor>,
         speedtest: Arc<SpeedtestEngine>,
+        traffic: Arc<TrafficStore>,
         events: broadcast::Sender<SchedulerEvent>,
     ) -> Arc<Self> {
         let s = settings.get();
@@ -63,6 +79,8 @@ impl Scheduler {
             settings,
             kernel,
             speedtest,
+            traffic,
+            api: parking_lot::RwLock::new(None),
             events,
             sub_task: parking_lot::Mutex::new(PeriodicTask::new(
                 "sub-update",
@@ -75,9 +93,20 @@ impl Scheduler {
                 // 启动时不定为已执行：让首轮就测一次，用户点开界面即有数据
                 None,
             )),
+            traffic_task: parking_lot::Mutex::new(PeriodicTask::new(
+                "traffic-collect",
+                TRAFFIC_COLLECT_PERIOD_MIN,
+                // 启动即采一次，建立基线
+                None,
+            )),
             sub_backoff: parking_lot::Mutex::new(Backoff::for_subscription()),
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// 内核就绪/停止时同步 API 引用（流量采集用）
+    pub fn set_api(&self, api: Option<Arc<dyn crate::kernel::SelectorApi>>) {
+        *self.api.write() = api;
     }
 
     fn emit(&self, kind: &str, message: impl Into<String>) {
@@ -139,7 +168,17 @@ impl Scheduler {
     }
 
     /// 一轮 tick
-    async fn tick(&self, now: i64, s: &AppSettings) {        // ---- 订阅更新 ----
+    async fn tick(&self, now: i64, s: &AppSettings) {        // ---- 流量采集（最高频，先做）----
+        let traffic_due = {
+            let t = self.traffic_task.lock();
+            t.is_due(now)
+        };
+        if traffic_due {
+            self.collect_traffic(now).await;
+            self.traffic_task.lock().mark_run(now);
+        }
+
+        // ---- 订阅更新 ----
         let sub_due = {
             let t = self.sub_task.lock();
             t.is_due(now)
@@ -156,6 +195,37 @@ impl Scheduler {
             };
             if speed_due {
                 self.run_speedtest(now).await;
+            }
+        }
+    }
+
+    /// 采集一次内核流量差值并落盘
+    async fn collect_traffic(&self, now: i64) {
+        if !self.kernel.state().is_running() {
+            return;
+        }
+        let api = self.api.read().clone();
+        let Some(api) = api else {
+            tracing::debug!("内核 API 未就绪，跳过流量采集");
+            return;
+        };
+
+        let totals = match api.traffic_totals().await {
+            Ok(t) => t,
+            Err(e) => {
+                // 采集失败不能中断调度循环（内核可能正在重启）
+                tracing::debug!(err = %e, "流量采集失败");
+                return;
+            }
+        };
+
+        if let Some((up, down)) = self.traffic.feed_cumulative(now, totals.up, totals.down) {
+            if up > 0 || down > 0 {
+                let _ = self.events.send(SchedulerEvent {
+                    kind: "traffic:tick".to_string(),
+                    message: format!("{up}/{down}"),
+                    at: now,
+                });
             }
         }
     }

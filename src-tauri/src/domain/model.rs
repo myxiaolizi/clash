@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// 当前设置 schema 版本。任何字段增删都必须升这个值，并在 migrate.rs 里处理。
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+///
+/// v1 → v2：新增 `compliance_accepted_at`
+/// v2 → v3：新增 `SwitchPolicy` 的失败转移字段；订阅新增用户名/密码/机场地址/备注；
+///          新增 `mihomo_mode`（规则/全局分流模式，与 `proxy_mode` 正交）
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +42,47 @@ pub enum ProxyMode {
 impl Default for ProxyMode {
     fn default() -> Self {
         ProxyMode::SystemProxy
+    }
+}
+
+/// 内核**分流模式**（mihomo `mode` 字段）。
+///
+/// 与 `ProxyMode` 是两个正交概念，早期实现混为一谈：
+/// - `ProxyMode` 回答「流量怎么进内核」：系统代理 / TUN / 手动
+/// - `MihomoMode` 回答「进内核后怎么走」：按规则 / 全局 / 直连
+///
+/// 前端的「规则 / 全局」开关操作的是本枚举，它**不改**抓流方式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MihomoMode {
+    Rule,
+    Global,
+    Direct,
+}
+
+impl Default for MihomoMode {
+    fn default() -> Self {
+        MihomoMode::Rule
+    }
+}
+
+impl MihomoMode {
+    /// 写入 config.yaml 的 `mode` 值（内核只认这三个小写字面量）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MihomoMode::Rule => "rule",
+            MihomoMode::Global => "global",
+            MihomoMode::Direct => "direct",
+        }
+    }
+
+    /// 从设置补丁里的字符串解析；未知值回退 rule（不得报错打断 UI）
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "global" => MihomoMode::Global,
+            "direct" => MihomoMode::Direct,
+            _ => MihomoMode::Rule,
+        }
     }
 }
 
@@ -98,6 +143,75 @@ pub struct SwitchPolicy {
     pub exclude_keywords: Vec<String>,
     /// 地区优先级（为空则不参与排序）
     pub prefer_region_priority: Vec<String>,
+
+    // ---- v3 新增：失败转移 ----
+    /// 当前节点连续失败达阈值后的动作
+    #[serde(default)]
+    pub on_failure_action: OnFailureAction,
+    /// 失败自动转移总开关（关掉后 on_failure_action 不生效）
+    #[serde(default = "default_true")]
+    pub failover_enabled: bool,
+    /// 重试模式下两次探测之间的间隔（秒）
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval_sec: u32,
+    /// 重试模式下最多重试几次，超过则视为失败
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// 切换后额外冷却时间（秒），在 min_dwell 之后继续抑制回切
+    #[serde(default)]
+    pub dwell_after_switch_sec: u32,
+    /// 只把本轮探测成功的节点当作候选（默认 true；关掉后允许用历史延迟兜底）
+    #[serde(default = "default_true")]
+    pub prefer_healthy_only: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_retry_interval() -> u32 {
+    5
+}
+
+fn default_max_retries() -> u32 {
+    2
+}
+
+/// 失败达阈值后的处置方式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailureAction {
+    /// 切到下一个可用节点（默认）
+    Switch,
+    /// 原地重试当前节点，超过 max_retries 才切
+    Retry,
+    /// 什么都不做，只在历史里留痕
+    Ignore,
+}
+
+impl Default for OnFailureAction {
+    fn default() -> Self {
+        OnFailureAction::Switch
+    }
+}
+
+impl OnFailureAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnFailureAction::Switch => "switch",
+            OnFailureAction::Retry => "retry",
+            OnFailureAction::Ignore => "none",
+        }
+    }
+
+    /// 从设置补丁解析；注意契约里「无动作」写作 `"none"`
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "retry" => OnFailureAction::Retry,
+            "none" => OnFailureAction::Ignore,
+            _ => OnFailureAction::Switch,
+        }
+    }
 }
 
 impl Default for SwitchPolicy {
@@ -121,6 +235,12 @@ impl Default for SwitchPolicy {
                 "域名".into(),
             ],
             prefer_region_priority: Vec::new(),
+            on_failure_action: OnFailureAction::Switch,
+            failover_enabled: true,
+            retry_interval_sec: 5,
+            max_retries: 2,
+            dwell_after_switch_sec: 0,
+            prefer_healthy_only: true,
         }
     }
 }
@@ -132,6 +252,11 @@ impl SwitchPolicy {
         self.min_dwell_sec = self.min_dwell_sec.clamp(30, 86_400);
         self.failure_threshold = self.failure_threshold.clamp(1, 10);
         self.manual_override_min = self.manual_override_min.min(1440);
+        // 重试间隔不许为 0（会变成忙轮询打满内核 API）
+        self.retry_interval_sec = self.retry_interval_sec.clamp(1, 300);
+        self.max_retries = self.max_retries.min(10);
+        // 额外冷却最多一天，且不得短于 0
+        self.dwell_after_switch_sec = self.dwell_after_switch_sec.min(86_400);
         // 关键词去重去空
         let mut seen = std::collections::HashSet::new();
         self.exclude_keywords = self
@@ -141,6 +266,21 @@ impl SwitchPolicy {
             .filter(|s| !s.is_empty())
             .filter(|s| seen.insert(s.clone()))
             .collect();
+    }
+
+    /// 切换后总共需要冷却多久才允许再次自动切换。
+    ///
+    /// 取 `min_dwell_sec + dwell_after_switch_sec`：前者是「别抖」，
+    /// 后者是「刚切过别马上切回来」，语义独立但可以叠加。
+    pub fn total_dwell_sec(&self) -> u32 {
+        self.min_dwell_sec
+            .saturating_add(self.dwell_after_switch_sec)
+            .min(86_400)
+    }
+
+    /// 失败处置是否真的会做切换（Ignore / 关闭 failover 时都不会）
+    pub fn should_failover(&self) -> bool {
+        self.failover_enabled && self.on_failure_action != OnFailureAction::Ignore
     }
 }
 
@@ -163,6 +303,11 @@ pub struct AppSettings {
     /// 首次合规提示接受时间；None = 未接受，必须再弹
     pub compliance_accepted_at: Option<i64>,
     pub proxy_mode: ProxyMode,
+    /// 内核分流模式：rule（按规则）/ global（全走主组）/ direct（全直连）。
+    ///
+    /// **与 `proxy_mode` 正交**：改这个不动系统代理/TUN。
+    #[serde(default)]
+    pub mihomo_mode: MihomoMode,
     /// 0 = 自动分配
     pub api_port: u16,
     /// 固定 "127.0.0.1"，不可由用户修改
@@ -199,6 +344,7 @@ impl Default for AppSettings {
             start_core_on_launch: true,
             compliance_accepted_at: None,
             proxy_mode: ProxyMode::SystemProxy,
+            mihomo_mode: MihomoMode::Rule,
             api_port: 0,
             bind_address: "127.0.0.1".to_string(),
             core_version: None,
@@ -342,6 +488,21 @@ pub struct Subscription {
     /// 排序用（越小越前）
     #[serde(default)]
     pub sort_order: u32,
+
+    // ---- v3 新增：机场管理信息（纯展示，不参与拉取）----
+    /// 机场登录用户名（明文：不是凭据，只是用户自己的备注性信息）
+    #[serde(default)]
+    pub username: Option<String>,
+    /// 机场登录密码 **DPAPI 密文**（base64）；空串 = 未设置。
+    /// 绝不进日志、绝不进 DTO，只在用户点「显示」时由独立命令解密。
+    #[serde(default)]
+    pub password_cipher: String,
+    /// 机场官网地址（"打开机场"按钮用）
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// 用户备注
+    #[serde(default)]
+    pub remark: Option<String>,
 }
 
 impl Subscription {
@@ -366,7 +527,16 @@ impl Subscription {
             node_count: 0,
             group_names: Vec::new(),
             sort_order: 0,
+            username: None,
+            password_cipher: String::new(),
+            homepage: None,
+            remark: None,
         }
+    }
+
+    /// 是否设置了密码（只暴露布尔，绝不暴露密文）
+    pub fn has_password(&self) -> bool {
+        !self.password_cipher.trim().is_empty()
     }
 
     /// 流量信息是否已陈旧（超过 2 个更新周期）
@@ -778,6 +948,305 @@ impl std::fmt::Display for ApiError {
 pub struct SwitchRuntimeLock {
     pub group: String,
     pub locked_at: i64,
+}
+
+// ============================================================================
+//  用户自定义规则（v3）
+// ============================================================================
+
+/// 规则匹配类型。对应 mihomo 规则的前缀。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleKind {
+    /// 精确域名：`DOMAIN,value,policy`
+    Domain,
+    /// 域名后缀：`DOMAIN-SUFFIX,value,policy`
+    DomainSuffix,
+    /// 域名关键字：`DOMAIN-KEYWORD,value,policy`
+    DomainKeyword,
+    /// 目标 IP / CIDR：`IP-CIDR,value,policy`（`no-resolve` 由内核按需补）
+    Ip,
+    /// 进程名：`PROCESS-NAME,value,policy`
+    Process,
+}
+
+impl RuleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleKind::Domain => "domain",
+            RuleKind::DomainSuffix => "domain_suffix",
+            RuleKind::DomainKeyword => "domain_keyword",
+            RuleKind::Ip => "ip",
+            RuleKind::Process => "process",
+        }
+    }
+
+    /// mihomo 规则类型前缀（大写，逐字）
+    pub fn mihomo_type(self) -> &'static str {
+        match self {
+            RuleKind::Domain => "DOMAIN",
+            RuleKind::DomainSuffix => "DOMAIN-SUFFIX",
+            RuleKind::DomainKeyword => "DOMAIN-KEYWORD",
+            RuleKind::Ip => "IP-CIDR",
+            RuleKind::Process => "PROCESS-NAME",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "domain" => RuleKind::Domain,
+            "domain_suffix" => RuleKind::DomainSuffix,
+            "domain_keyword" => RuleKind::DomainKeyword,
+            "ip" => RuleKind::Ip,
+            "process" => RuleKind::Process,
+            _ => return None,
+        })
+    }
+}
+
+/// 规则命中后的去向
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RulePolicy {
+    /// 走主策略组
+    Proxy,
+    /// 直连
+    Direct,
+    /// 拒绝
+    Block,
+}
+
+impl RulePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RulePolicy::Proxy => "proxy",
+            RulePolicy::Direct => "direct",
+            RulePolicy::Block => "block",
+        }
+    }
+
+    /// 写入 rules 段的第三个字段
+    pub fn mihomo_target(self) -> &'static str {
+        match self {
+            RulePolicy::Proxy => "Proxy",
+            RulePolicy::Direct => "DIRECT",
+            RulePolicy::Block => "REJECT",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "proxy" => RulePolicy::Proxy,
+            "direct" => RulePolicy::Direct,
+            "block" => RulePolicy::Block,
+            _ => return None,
+        })
+    }
+}
+
+/// 一条用户规则
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserRule {
+    /// 稳定 id（前端上下移动/删除用）
+    pub id: String,
+    pub kind: RuleKind,
+    /// 匹配值（域名 / CIDR / 关键字 / 进程名）
+    pub value: String,
+    pub policy: RulePolicy,
+    pub enabled: bool,
+    /// 排序（越小越前；等于数组下标语义）
+    #[serde(default)]
+    pub sort_order: u32,
+}
+
+impl UserRule {
+    /// 渲染成 mihomo rules 段的一行。
+    ///
+    /// `main_group` 是当前主组名——不能硬编码 "Proxy"，
+    /// 万一将来主组改名，规则会指向不存在的组导致内核拒绝启动。
+    pub fn to_mihomo_line(&self, main_group: &str) -> String {
+        let target = match self.policy {
+            RulePolicy::Proxy => main_group,
+            other => other.mihomo_target(),
+        };
+        // IP 规则加 no-resolve：避免命中域名时多做一次 DNS 解析（延迟 + 泄漏）
+        if self.kind == RuleKind::Ip {
+            format!("{},{},{},no-resolve", self.kind.mihomo_type(), self.value, target)
+        } else {
+            format!("{},{},{}", self.kind.mihomo_type(), self.value, target)
+        }
+    }
+}
+
+/// 规则库根对象（落 `rules.json`）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuleSet {
+    #[serde(default)]
+    pub rules: Vec<UserRule>,
+}
+
+impl RuleSet {
+    /// 取启用中的规则，按 sort_order 升序（同序时保持插入序，稳定）
+    pub fn active_sorted(&self) -> Vec<&UserRule> {
+        let mut v: Vec<&UserRule> = self.rules.iter().filter(|r| r.enabled).collect();
+        v.sort_by_key(|r| r.sort_order);
+        v
+    }
+
+    /// 渲染成 rules 段行列表（用户规则在前，调用方再追加兜底 MATCH）
+    pub fn to_mihomo_lines(&self, main_group: &str) -> Vec<String> {
+        self.active_sorted()
+            .into_iter()
+            .map(|r| r.to_mihomo_line(main_group))
+            .collect()
+    }
+
+    /// 按当前顺序重排 sort_order（0..n），保证与数组一致
+    pub fn reindex(&mut self) {
+        for (i, r) in self.rules.iter_mut().enumerate() {
+            r.sort_order = i as u32;
+        }
+    }
+}
+
+// ============================================================================
+//  流量统计（v3）
+// ============================================================================
+
+/// 一个统计桶（小时或天）的上下行字节
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficBucket {
+    pub up: u64,
+    pub down: u64,
+}
+
+impl TrafficBucket {
+    pub fn total(&self) -> u64 {
+        self.up.saturating_add(self.down)
+    }
+
+    pub fn add(&mut self, up: u64, down: u64) {
+        self.up = self.up.saturating_add(up);
+        self.down = self.down.saturating_add(down);
+    }
+}
+
+/// 趋势图的一个点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyTraffic {
+    /// 小时起点（Unix 秒，已对齐到整点）
+    pub hour: i64,
+    pub up: u64,
+    pub down: u64,
+}
+
+/// 持久化的流量统计。
+///
+/// 只存「按天」聚合 + 「最近 N 小时」明细：
+/// - 按天用于累计与今日
+/// - 按小时用于趋势图（超过 24 小时的部分丢弃，避免文件无限增长）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrafficStats {
+    /// 累计上行（跨天累加，永不重置）
+    #[serde(default)]
+    pub total_up: u64,
+    /// 累计下行
+    #[serde(default)]
+    pub total_down: u64,
+    /// 今日归属的日期（Unix 天序号；0 = 尚未初始化）
+    #[serde(default)]
+    pub day: i64,
+    /// 今日上行
+    #[serde(default)]
+    pub today_up: u64,
+    /// 今日下行
+    #[serde(default)]
+    pub today_down: u64,
+    /// 最近若干小时的桶（按 hour 升序）
+    #[serde(default)]
+    pub hourly: Vec<HourlyTraffic>,
+    /// 上次采集时刻
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// 小时桶最多保留多少个（24 小时趋势够用，多留一点防止 tick 漂移丢点）
+pub const TRAFFIC_HOURLY_KEEP: usize = 48;
+
+impl TrafficStats {
+    /// Unix 秒 → 天序号（本地时区无关，按 UTC 切，够用且确定）
+    pub fn day_of(ts: i64) -> i64 {
+        ts.div_euclid(86_400)
+    }
+
+    /// Unix 秒 → 整点起点
+    pub fn hour_of(ts: i64) -> i64 {
+        ts.div_euclid(3_600) * 3_600
+    }
+
+    /// 记一次增量。`up`/`down` 是**本次采集相对上次的差值**，不是总量。
+    ///
+    /// 跨天时把今日清零并保留累计，保证「今日」语义正确。
+    pub fn record(&mut self, now: i64, up: u64, down: u64) {
+        // 1. 跨天滚动
+        let today = Self::day_of(now);
+        if self.day == 0 {
+            self.day = today;
+        } else if today != self.day {
+            tracing::debug!(from = self.day, to = today, "流量统计跨天，今日计数归零");
+            self.day = today;
+            self.today_up = 0;
+            self.today_down = 0;
+        }
+
+        // 2. 累加
+        self.today_up = self.today_up.saturating_add(up);
+        self.today_down = self.today_down.saturating_add(down);
+        self.total_up = self.total_up.saturating_add(up);
+        self.total_down = self.total_down.saturating_add(down);
+        self.updated_at = now;
+
+        // 3. 小时桶
+        let hour = Self::hour_of(now);
+        match self.hourly.iter_mut().find(|h| h.hour == hour) {
+            Some(h) => {
+                h.up = h.up.saturating_add(up);
+                h.down = h.down.saturating_add(down);
+            }
+            None => self.hourly.push(HourlyTraffic {
+                hour,
+                up,
+                down,
+            }),
+        }
+        self.hourly.sort_by_key(|h| h.hour);
+        if self.hourly.len() > TRAFFIC_HOURLY_KEEP {
+            let drop_n = self.hourly.len() - TRAFFIC_HOURLY_KEEP;
+            self.hourly.drain(0..drop_n);
+        }
+    }
+
+    /// 取最近 `hours` 小时的桶（升序），缺失的小时补 0 保证曲线连续。
+    pub fn recent_hours(&self, now: i64, hours: usize) -> Vec<HourlyTraffic> {
+        let cur_hour = Self::hour_of(now);
+        let mut out = Vec::with_capacity(hours);
+        for i in (0..hours).rev() {
+            let hour = cur_hour - (i as i64) * 3_600;
+            match self.hourly.iter().find(|h| h.hour == hour) {
+                Some(h) => out.push(HourlyTraffic {
+                    hour,
+                    up: h.up,
+                    down: h.down,
+                }),
+                None => out.push(HourlyTraffic {
+                    hour,
+                    up: 0,
+                    down: 0,
+                }),
+            }
+        }
+        out
+    }
 }
 
 // ============================================================================

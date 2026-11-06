@@ -143,8 +143,13 @@ fn apply_patch(x: &mut crate::domain::model::AppSettings, p: &SettingsPatch) {
         x.proxy_mode = match v.as_str() {
             "tun" => ProxyMode::Tun,
             "manual" => ProxyMode::Manual,
+            // 兼容旧前端可能发的 "rule"/"global"：那是分流模式，不是代理方式，
+            // 早期混用导致用户切"全局"时系统代理被意外关掉。这里只认代理方式。
             _ => ProxyMode::SystemProxy,
         };
+    }
+    if let Some(v) = &p.mihomo_mode {
+        x.mihomo_mode = crate::domain::model::MihomoMode::parse(v);
     }
     if let Some(v) = p.api_port {
         x.api_port = v;
@@ -201,6 +206,13 @@ fn apply_patch(x: &mut crate::domain::model::AppSettings, p: &SettingsPatch) {
         x.switch_policy.manual_override_min = pol.manual_override_min;
         x.switch_policy.exclude_keywords = pol.exclude_keywords.clone();
         x.switch_policy.prefer_region_priority = pol.prefer_region_priority.clone();
+        // v3 失败转移
+        x.switch_policy.on_failure_action = pol.on_failure_parsed();
+        x.switch_policy.failover_enabled = pol.failover_enabled;
+        x.switch_policy.retry_interval_sec = pol.retry_interval_sec;
+        x.switch_policy.max_retries = pol.max_retries;
+        x.switch_policy.dwell_after_switch_sec = pol.dwell_after_switch_sec;
+        x.switch_policy.prefer_healthy_only = pol.prefer_healthy_only;
     }
     if let Some(v) = p.notify_on_switch {
         x.notify_on_switch = v;
@@ -261,13 +273,31 @@ pub async fn core_status_inner(s: &Arc<crate::commands::state::AppState>) -> App
         crate::domain::model::CoreState::Failed(m) => ("failed", Some(m.clone())),
     };
 
+    // ★ 修复「未安装」误判：以磁盘上的实际文件为准，而不是设置项。
+    //
+    // 早期直接返回 `settings.core_version`，用户没手动选过版本时它是 None，
+    // 前端据此显示"内核未安装"——但内核其实早就装好了，重启后照样能跑。
+    let installed_list = crate::kernel::fetch_core::list_installed(&s.paths);
+    let installed_version = installed_list.first().map(|c| c.version.clone());
+    let installed = !installed_list.is_empty();
+
+    // version 优先用设置里指定的版本（用户可能装了多个版本手选其一），
+    // 没指定就用磁盘上最新的那个 —— 这才是"当前实际会用到的版本"。
+    let version = settings
+        .core_version
+        .clone()
+        .filter(|v| installed_list.iter().any(|c| &c.version == v))
+        .or_else(|| installed_version.clone());
+
     Ok(CoreStatusDto {
         state: state_str.to_string(),
         error,
-        version: settings.core_version.clone(),
+        version,
         mixed_port: ports.map(|p| p.0),
         api_port: ports.map(|p| p.1),
         uptime_sec: s.core_uptime(),
+        installed,
+        installed_version,
     })
 }
 
@@ -470,14 +500,23 @@ pub fn runtime_dto(s: &Arc<crate::commands::state::AppState>) -> RuntimeDto {
         crate::domain::model::CoreState::Failed(m) => ("failed", Some(m.clone())),
     };
     let settings = s.settings.get();
+    let installed_list = crate::kernel::fetch_core::list_installed(&s.paths);
+    let installed_version = installed_list.first().map(|c| c.version.clone());
+    let version = settings
+        .core_version
+        .clone()
+        .filter(|v| installed_list.iter().any(|c| &c.version == v))
+        .or_else(|| installed_version.clone());
     RuntimeDto {
         core: CoreStatusDto {
             state: state_str.to_string(),
             error,
-            version: settings.core_version.clone(),
+            version,
             mixed_port: ports.map(|p| p.0),
             api_port: ports.map(|p| p.1),
             uptime_sec: s.core_uptime(),
+            installed: !installed_list.is_empty(),
+            installed_version,
         },
         sysproxy_enabled: sy.enabled,
         sysproxy_managed: sy.managed_by_us,
@@ -613,11 +652,27 @@ mod tests {
             manual_override_min: 30,
             exclude_keywords: vec!["测试".into()],
             prefer_region_priority: vec!["HK".into()],
+            on_failure_action: "retry".into(),
+            failover_enabled: false,
+            retry_interval_sec: 10,
+            max_retries: 5,
+            dwell_after_switch_sec: 120,
+            prefer_healthy_only: false,
         });
         apply_patch(&mut s, &p);
         assert!(!s.switch_policy.enabled);
         assert_eq!(s.switch_policy.tolerance_ms, 50);
         assert_eq!(s.switch_policy.exclude_keywords, vec!["测试"]);
+        // v3 字段
+        assert_eq!(
+            s.switch_policy.on_failure_action,
+            crate::domain::model::OnFailureAction::Retry
+        );
+        assert!(!s.switch_policy.failover_enabled);
+        assert_eq!(s.switch_policy.retry_interval_sec, 10);
+        assert_eq!(s.switch_policy.max_retries, 5);
+        assert_eq!(s.switch_policy.dwell_after_switch_sec, 120);
+        assert!(!s.switch_policy.prefer_healthy_only);
     }
 
     #[test]
@@ -661,5 +716,37 @@ mod tests {
             apply_patch(&mut s, &p);
             assert_eq!(s.proxy_mode, expect);
         }
+    }
+
+    #[test]
+    fn patch_mihomo_mode_maps() {
+        use crate::domain::model::MihomoMode;
+        for (input, expect) in [
+            ("rule", MihomoMode::Rule),
+            ("global", MihomoMode::Global),
+            ("direct", MihomoMode::Direct),
+            ("bogus", MihomoMode::Rule),
+        ] {
+            let mut s = AppSettings::default();
+            let mut p = SettingsPatch::default();
+            p.mihomo_mode = Some(input.into());
+            apply_patch(&mut s, &p);
+            assert_eq!(s.mihomo_mode, expect, "输入 {input}");
+        }
+    }
+
+    #[test]
+    fn mihomo_mode_does_not_touch_proxy_mode() {
+        // 关键回归：切「全局」不得顺手改掉代理方式（早期混用导致系统代理被关）
+        use crate::domain::model::MihomoMode;
+        let mut s = AppSettings::default();
+        s.proxy_mode = ProxyMode::Tun;
+
+        let mut p = SettingsPatch::default();
+        p.mihomo_mode = Some("global".into());
+        apply_patch(&mut s, &p);
+
+        assert_eq!(s.mihomo_mode, MihomoMode::Global);
+        assert_eq!(s.proxy_mode, ProxyMode::Tun, "代理方式不得被分流模式改动");
     }
 }

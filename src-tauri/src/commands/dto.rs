@@ -66,6 +66,16 @@ pub struct SubscriptionDto {
     pub node_count: u32,
     pub sort_order: u32,
     pub traffic: Option<TrafficDto>,
+
+    // ---- v3：机场管理信息 ----
+    /// 机场登录用户名（明文，非凭据）
+    pub username: Option<String>,
+    /// 是否已设置密码（**只暴露布尔，绝不返回密文或明文**）
+    pub has_password: bool,
+    /// 机场官网地址
+    pub homepage: Option<String>,
+    /// 用户备注
+    pub remark: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +139,10 @@ impl From<&Subscription> for SubscriptionDto {
                 d.stale = s.userinfo_stale(now);
                 d
             }),
+            username: s.username.clone(),
+            has_password: s.has_password(),
+            homepage: s.homepage.clone(),
+            remark: s.remark.clone(),
         }
     }
 }
@@ -241,6 +255,8 @@ pub struct SettingsDto {
     pub start_core_on_launch: bool,
     pub compliance_accepted: bool,
     pub proxy_mode: String,
+    /// 内核分流模式："rule" | "global" | "direct"（与 proxyMode 正交）
+    pub mihomo_mode: String,
     pub api_port: u16,
     pub core_version: Option<String>,
     pub core_download_proxy: Option<String>,
@@ -272,6 +288,41 @@ pub struct PolicyDto {
     pub manual_override_min: u32,
     pub exclude_keywords: Vec<String>,
     pub prefer_region_priority: Vec<String>,
+
+    // ---- v3：失败转移 ----
+    /// "switch" | "retry" | "none"
+    #[serde(default = "default_on_failure_action")]
+    pub on_failure_action: String,
+    #[serde(default = "default_true")]
+    pub failover_enabled: bool,
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval_sec: u32,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub dwell_after_switch_sec: u32,
+    #[serde(default = "default_true")]
+    pub prefer_healthy_only: bool,
+}
+
+fn default_on_failure_action() -> String {
+    "switch".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_retry_interval() -> u32 {
+    5
+}
+fn default_max_retries() -> u32 {
+    2
+}
+
+impl PolicyDto {
+    /// 把 DTO 的字符串字段解析成内部枚举（未知值回退默认，不报错）
+    pub fn on_failure_parsed(&self) -> crate::domain::model::OnFailureAction {
+        crate::domain::model::OnFailureAction::parse(&self.on_failure_action)
+    }
 }
 
 impl From<&SwitchPolicy> for PolicyDto {
@@ -284,6 +335,12 @@ impl From<&SwitchPolicy> for PolicyDto {
             manual_override_min: p.manual_override_min,
             exclude_keywords: p.exclude_keywords.clone(),
             prefer_region_priority: p.prefer_region_priority.clone(),
+            on_failure_action: p.on_failure_action.as_str().to_string(),
+            failover_enabled: p.failover_enabled,
+            retry_interval_sec: p.retry_interval_sec,
+            max_retries: p.max_retries,
+            dwell_after_switch_sec: p.dwell_after_switch_sec,
+            prefer_healthy_only: p.prefer_healthy_only,
         }
     }
 }
@@ -308,6 +365,7 @@ impl From<&AppSettings> for SettingsDto {
                 crate::domain::model::ProxyMode::Manual => "manual",
             }
             .to_string(),
+            mihomo_mode: s.mihomo_mode.as_str().to_string(),
             api_port: s.api_port,
             core_version: s.core_version.clone(),
             core_download_proxy: s.core_download_proxy.clone(),
@@ -347,6 +405,8 @@ pub struct SettingsPatch {
     pub silent_start: Option<bool>,
     pub start_core_on_launch: Option<bool>,
     pub proxy_mode: Option<String>,
+    /// 分流模式："rule" | "global" | "direct"
+    pub mihomo_mode: Option<String>,
     pub api_port: Option<u16>,
     pub core_version: Option<String>,
     pub core_download_proxy: Option<String>,
@@ -382,6 +442,13 @@ pub struct CoreStatusDto {
     pub mixed_port: Option<u16>,
     pub api_port: Option<u16>,
     pub uptime_sec: i64,
+    /// 内核是否**已安装到磁盘**（与 state 无关）。
+    ///
+    /// 早期前端把 `version == null` 当成"未安装"，但 version 来自设置项，
+    /// 用户没手动选过版本时它一直是 None —— 于是明明装好了也显示"未安装"。
+    pub installed: bool,
+    /// 磁盘上实际可用的最新版本（未安装时为 None）
+    pub installed_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +577,96 @@ impl OpResultDto {
     }
 }
 
+// ============================================================================
+//  规则（v3）
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleDto {
+    pub id: String,
+    /// "domain" | "domain_suffix" | "domain_keyword" | "ip" | "process"
+    pub kind: String,
+    pub value: String,
+    /// "proxy" | "direct" | "block"
+    pub policy: String,
+    pub enabled: bool,
+    pub sort_order: u32,
+    /// 渲染后的 mihomo 规则行（排障/预览用，前端只读展示）
+    pub line: String,
+}
+
+impl From<&crate::domain::model::UserRule> for RuleDto {
+    fn from(r: &crate::domain::model::UserRule) -> Self {
+        Self {
+            id: r.id.clone(),
+            kind: r.kind.as_str().to_string(),
+            value: r.value.clone(),
+            policy: r.policy.as_str().to_string(),
+            enabled: r.enabled,
+            sort_order: r.sort_order,
+            line: r.to_mihomo_line(crate::subscription::generator::MAIN_GROUP_DEFAULT),
+        }
+    }
+}
+
+// ============================================================================
+//  流量统计（v3）
+// ============================================================================
+
+/// 流量统计结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficStatsDto {
+    pub today_up: u64,
+    pub today_down: u64,
+    pub session_up: u64,
+    pub session_down: u64,
+    pub total_up: u64,
+    pub total_down: u64,
+    /// 近 24 小时趋势（升序，缺失小时补 0）
+    pub hourly: Vec<HourlyPointDto>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourlyPointDto {
+    /// 小时起点（Unix 秒）
+    pub hour: i64,
+    pub up: u64,
+    pub down: u64,
+}
+
+impl TrafficStatsDto {
+    /// `session_*` = 本次内核运行期间的累计（由调用方传入内核原始读数）
+    pub fn build(
+        stats: &crate::domain::model::TrafficStats,
+        now: i64,
+        session_up: u64,
+        session_down: u64,
+    ) -> Self {
+        Self {
+            today_up: stats.today_up,
+            today_down: stats.today_down,
+            session_up,
+            session_down,
+            total_up: stats.total_up,
+            total_down: stats.total_down,
+            hourly: stats
+                .recent_hours(now, 24)
+                .into_iter()
+                .map(|h| HourlyPointDto {
+                    hour: h.hour,
+                    up: h.up,
+                    down: h.down,
+                })
+                .collect(),
+            updated_at: stats.updated_at,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +691,103 @@ mod tests {
         assert_eq!(dto.min_dwell_sec, 300);
         assert_eq!(dto.failure_threshold, 2);
         assert_eq!(dto.manual_override_min, 60);
+        // v3 失败转移字段
+        assert_eq!(dto.on_failure_action, "switch");
+        assert!(dto.failover_enabled);
+        assert_eq!(dto.retry_interval_sec, 5);
+        assert_eq!(dto.max_retries, 2);
+        assert_eq!(dto.dwell_after_switch_sec, 0);
+        assert!(dto.prefer_healthy_only);
+    }
+
+    #[test]
+    fn policy_dto_on_failure_strings() {
+        let mut p = SwitchPolicy::default();
+        p.on_failure_action = crate::domain::model::OnFailureAction::Retry;
+        assert_eq!(PolicyDto::from(&p).on_failure_action, "retry");
+        p.on_failure_action = crate::domain::model::OnFailureAction::Ignore;
+        assert_eq!(
+            PolicyDto::from(&p).on_failure_action,
+            "none",
+            "无动作在契约里写作 none"
+        );
+    }
+
+    #[test]
+    fn policy_dto_deserializes_without_new_fields() {
+        // 老前端只发旧字段，必须能解析（新字段走 serde default）
+        let old = r#"{"enabled":true,"toleranceMs":30,"minDwellSec":300,
+            "failureThreshold":2,"manualOverrideMin":60,
+            "excludeKeywords":[],"preferRegionPriority":[]}"#;
+        let dto: PolicyDto = serde_json::from_str(old).unwrap();
+        assert_eq!(dto.on_failure_action, "switch");
+        assert!(dto.failover_enabled);
+    }
+
+    #[test]
+    fn subscription_dto_exposes_has_password_not_cipher() {
+        let mut sub = Subscription::new(
+            "u".into(),
+            "n".into(),
+            "URL_CIPHER".into(),
+            "h".into(),
+            360,
+        );
+        sub.username = Some("bob".into());
+        sub.homepage = Some("https://a.com".into());
+        sub.remark = Some("备注".into());
+        sub.password_cipher = "PASSWORD_CIPHER_VALUE".into();
+
+        let dto = SubscriptionDto::from(&sub);
+        assert!(dto.has_password, "只暴露布尔");
+
+        let j = serde_json::to_string(&dto).unwrap();
+        assert!(!j.contains("PASSWORD_CIPHER_VALUE"), "密码密文绝不能进 DTO");
+        assert!(!j.contains("URL_CIPHER"));
+        assert!(j.contains("\"hasPassword\":true"));
+        assert!(j.contains("\"username\":\"bob\""));
+        assert!(j.contains("\"homepage\":\"https://a.com\""));
+        assert!(j.contains("\"remark\":\"备注\""));
+    }
+
+    #[test]
+    fn subscription_dto_has_password_false_when_empty() {
+        let sub = Subscription::new("u".into(), "n".into(), "c".into(), "h".into(), 360);
+        assert!(!SubscriptionDto::from(&sub).has_password);
+    }
+
+    #[test]
+    fn rule_dto_renders_line() {
+        let r = crate::domain::model::UserRule {
+            id: "r1".into(),
+            kind: crate::domain::model::RuleKind::DomainSuffix,
+            value: "example.com".into(),
+            policy: crate::domain::model::RulePolicy::Proxy,
+            enabled: true,
+            sort_order: 0,
+        };
+        let dto = RuleDto::from(&r);
+        assert_eq!(dto.kind, "domain_suffix");
+        assert_eq!(dto.policy, "proxy");
+        assert_eq!(dto.line, "DOMAIN-SUFFIX,example.com,Proxy");
+    }
+
+    #[test]
+    fn traffic_stats_dto_builds_24_hours() {
+        let mut stats = crate::domain::model::TrafficStats::default();
+        let now = 100 * 3_600 + 10;
+        stats.record(now, 100, 200);
+
+        let dto = TrafficStatsDto::build(&stats, now, 5, 6);
+        assert_eq!(dto.today_up, 100);
+        assert_eq!(dto.session_up, 5, "session 是内核本次运行读数");
+        assert_eq!(dto.hourly.len(), 24, "固定 24 个点，前端直接画图");
+        assert_eq!(dto.hourly.last().unwrap().up, 100);
+
+        let j = serde_json::to_string(&dto).unwrap();
+        assert!(j.contains("\"todayUp\""));
+        assert!(j.contains("\"sessionDown\""));
+        assert!(j.contains("\"totalUp\""));
     }
 
     #[test]

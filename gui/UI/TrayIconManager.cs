@@ -1,3 +1,4 @@
+using System.IO;
 using System.Runtime.InteropServices;
 using ClashZhengl.Core;
 
@@ -34,6 +35,9 @@ public sealed class TrayIconManager : IDisposable
     private const int NIF_TIP = 0x00000004;
 
     private const int IDI_APPLICATION = 32512;
+
+    /// <summary>托盘图标按 16x16 取，跟系统 DPI 无关，通知区域固定用这个尺寸。</summary>
+    private const int TRAY_ICON_SIZE = 16;
 
     private const int MF_STRING = 0x00000000;
     private const int MF_SEPARATOR = 0x00000800;
@@ -72,7 +76,15 @@ public sealed class TrayIconManager : IDisposable
             if (_hwnd == IntPtr.Zero) return;
 
             if (_hIcon == IntPtr.Zero)
+                _hIcon = LoadAppIcon();
+
+            if (_hIcon == IntPtr.Zero)
+            {
+                // 兜底：实在取不到就退回系统默认图标，
+                // 至少托盘里有个能点的项，不至于完全消失。
                 _hIcon = LoadIconW(IntPtr.Zero, IDI_APPLICATION);
+                Log.Warn("未能加载应用图标，托盘回退到系统默认图标");
+            }
 
             var data = new NOTIFYICONDATAW
             {
@@ -92,6 +104,82 @@ public sealed class TrayIconManager : IDisposable
         {
             Log.Error("创建托盘图标失败", e);
         }
+    }
+
+    /// <summary>
+    /// 加载应用自己的托盘图标。
+    ///
+    /// 0.1.0 直接 <c>LoadIconW(IntPtr.Zero, IDI_APPLICATION)</c>，那是系统
+    /// 通用的「默认程序」图标，于是托盘里显示成一个无特征的方块，
+    /// 每个程序长得一模一样，根本分不出这个是 Clash Zhengl。
+    ///
+    /// 正确做法是从**当前 exe 自己的图标资源**里取：
+    /// exe 已经通过 &lt;ApplicationIcon&gt; 嵌入了 Assets\app.ico，
+    /// <c>ExtractIconExW</c> 按索引 0 拿到的就是它。
+    ///
+    /// 三个来源依次尝试：exe 图标 → 附近 .ico 文件 → 失败返回 Zero。
+    /// </summary>
+    private IntPtr LoadAppIcon()
+    {
+        // 1. 从当前进程的 exe 里提取（最可靠，图标随 exe 打包）
+        try
+        {
+            var exe = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(exe))
+            {
+                var got = ExtractIconExW(exe, 0, out var large, out var small, 1);
+                if (got > 0)
+                {
+                    // 通知区域只用 small。large 用不上就立刻销毁，
+                    // 避免多占一个 GDI 句柄（ExtractIconEx 返回的是调用方拥有的资源）。
+                    if (small != IntPtr.Zero)
+                    {
+                        if (large != IntPtr.Zero && large != small)
+                            DestroyIcon(large);
+                        Log.Info("托盘图标已从 exe 提取");
+                        return small;
+                    }
+
+                    if (large != IntPtr.Zero)
+                    {
+                        Log.Info("托盘图标已从 exe 提取（large）");
+                        return large;
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"从 exe 提取图标失败：{e.Message}");
+        }
+
+        // 2. 从 exe 同目录的 app.ico 读（单文件发布或图标资源被剥离时的备用路径）
+        try
+        {
+            var dir = Path.GetDirectoryName(Environment.ProcessPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                foreach (var name in new[] { "app.ico", "Assets\\app.ico" })
+                {
+                    var icoPath = Path.Combine(dir, name);
+                    if (!File.Exists(icoPath)) continue;
+
+                    var h = LoadImageW(IntPtr.Zero, icoPath, IMAGE_ICON,
+                        TRAY_ICON_SIZE, TRAY_ICON_SIZE, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+                    if (h != IntPtr.Zero)
+                    {
+                        Log.Info($"托盘图标已从文件加载：{icoPath}");
+                        return h;
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"从文件加载图标失败：{e.Message}");
+        }
+
+        return IntPtr.Zero;
     }
 
     private void CreateMessageWindow()
@@ -233,6 +321,14 @@ public sealed class TrayIconManager : IDisposable
                 _hwnd = IntPtr.Zero;
             }
 
+            // 图标句柄是 ExtractIconEx / LoadImage 返回的、由调用方拥有的资源，
+            // 不 DestroyIcon 会一直占到进程退出。
+            if (_hIcon != IntPtr.Zero)
+            {
+                DestroyIcon(_hIcon);
+                _hIcon = IntPtr.Zero;
+            }
+
             UnregisterClassW("ClashZhenglTrayWnd", GetModuleHandleW(null));
         }
         catch (Exception e)
@@ -301,6 +397,23 @@ public sealed class TrayIconManager : IDisposable
 
     [DllImport("user32.dll")]
     private static extern IntPtr LoadIconW(IntPtr hInstance, int iconId);
+
+    // ---- 应用图标提取（替代系统默认图标）----
+
+    private const int IMAGE_ICON = 1;
+    private const int LR_LOADFROMFILE = 0x0010;
+    private const int LR_DEFAULTSIZE = 0x0040;
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint ExtractIconExW(string file, int iconIndex,
+        out IntPtr largeIcon, out IntPtr smallIcon, uint iconCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadImageW(IntPtr hInstance, string name,
+        int type, int cx, int cy, int load);
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandleW(string? moduleName);

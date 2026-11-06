@@ -35,6 +35,20 @@ pub trait SelectorApi: Send + Sync {
     ) -> ApiFuture<'_, u32>;
     /// 内核版本（健康检查）
     fn version(&self) -> ApiFuture<'_, String>;
+    /// 内核**进程累计**上下行字节（来自 `GET /connections` 汇总）。
+    ///
+    /// 注意语义：这是本次进程从启动到现在的累计值，内核重启就归零。
+    /// 要「今日/累计」必须由调用方做差分并持久化。
+    fn traffic_totals(&self) -> ApiFuture<'_, TrafficTotals>;
+    /// 当前连接数（趋势图/状态展示用）
+    fn connection_count(&self) -> ApiFuture<'_, usize>;
+}
+
+/// 内核进程累计流量
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrafficTotals {
+    pub up: u64,
+    pub down: u64,
 }
 
 // ============================================================================
@@ -198,6 +212,28 @@ struct VersionResp {
     version: String,
 }
 
+/// `GET /connections` 响应。只取我们需要的字段。
+///
+/// 注意 `downloadTotal` / `uploadTotal` 是**进程累计**，
+/// 而每条 connection 的 `upload`/`download` 是该连接的累计 —— 两者不能混用。
+#[derive(Debug, Deserialize)]
+struct ConnectionsResp {
+    #[serde(default, rename = "downloadTotal")]
+    download_total: u64,
+    #[serde(default, rename = "uploadTotal")]
+    upload_total: u64,
+    #[serde(default)]
+    connections: Option<Vec<ConnEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnEntry {
+    #[serde(default)]
+    upload: u64,
+    #[serde(default)]
+    download: u64,
+}
+
 impl SelectorApi for HttpKernelApi {
     fn proxies_selectable(&self) -> ApiFuture<'_, Vec<SelectableGroup>> {
         Box::pin(async move {
@@ -284,6 +320,34 @@ impl SelectorApi for HttpKernelApi {
         Box::pin(async move {
             let r: VersionResp = self.get_json("/version").await?;
             Ok(r.version)
+        })
+    }
+
+    fn traffic_totals(&self) -> ApiFuture<'_, TrafficTotals> {
+        Box::pin(async move {
+            let r: ConnectionsResp = self.get_json("/connections").await?;
+            // 优先用汇总字段；老版本内核缺这两个字段时回退为逐条累加，
+            // 避免"升级后流量统计全是 0"这种难以察觉的回归。
+            if r.download_total == 0 && r.upload_total == 0 {
+                if let Some(list) = &r.connections {
+                    let up: u64 = list.iter().map(|c| c.upload).sum();
+                    let down: u64 = list.iter().map(|c| c.download).sum();
+                    if up > 0 || down > 0 {
+                        return Ok(TrafficTotals { up, down });
+                    }
+                }
+            }
+            Ok(TrafficTotals {
+                up: r.upload_total,
+                down: r.download_total,
+            })
+        })
+    }
+
+    fn connection_count(&self) -> ApiFuture<'_, usize> {
+        Box::pin(async move {
+            let r: ConnectionsResp = self.get_json("/connections").await?;
+            Ok(r.connections.map(|c| c.len()).unwrap_or(0))
         })
     }
 }

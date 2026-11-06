@@ -24,6 +24,23 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> AppResult<Self> {
+        // 数据根目录覆盖：便携模式与端到端测试用。
+        //
+        // 为什么需要它：Windows 上 `dirs::config_dir()` 走的是
+        // SHGetKnownFolderPath（已知文件夹 API），**不读 APPDATA 环境变量** ——
+        // 只改环境变量做隔离是无效的，daemon 照样读写真实用户数据。
+        // 所以必须提供一条显式的覆盖通道。
+        //
+        // 用法：设 `CZ_DATA_ROOT=<dir>`，roaming 与 local 都落在其下。
+        if let Some(root) = std::env::var_os("CZ_DATA_ROOT") {
+            let root = PathBuf::from(root);
+            if !root.as_os_str().is_empty() {
+                return Ok(Self {
+                    roaming: root.join("roaming"),
+                    local: root.join("local"),
+                });
+            }
+        }
         let roaming = dirs::config_dir()
             .ok_or_else(|| AppError::new(ErrorCode::StoreIo))?
             .join(APP_DIR_NAME);
@@ -150,6 +167,16 @@ impl Paths {
         self.runtime_dir().join("switch-history.json")
     }
 
+    /// 用户自定义规则库（Roaming：属于用户数据，跟着设置一起备份）
+    pub fn rules_file(&self) -> PathBuf {
+        self.roaming.join("rules.json")
+    }
+
+    /// 流量统计（Roaming：同样是用户数据）
+    pub fn traffic_stats_file(&self) -> PathBuf {
+        self.roaming.join("traffic-stats.json")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.local.join("logs")
     }
@@ -251,6 +278,9 @@ pub fn write_json<T: serde::Serialize>(path: &Path, v: &T) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    /// 环境变量是进程级全局状态，涉及它的测试必须串行，否则并行跑会互相覆盖
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn atomic_write_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -292,6 +322,49 @@ mod tests {
     }
 
     #[test]
+    fn data_root_override_is_used_for_both_roots() {
+        // 回归：Windows 上 dirs 走已知文件夹 API，不认 APPDATA 环境变量，
+        // 因此端到端测试必须靠 CZ_DATA_ROOT 才能真隔离。
+        // 这里直接验证 resolve() 的分支逻辑（用临时值，测完复原）。
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("czroot");
+
+        // 串行执行：环境变量是进程全局的，并行测试会互相干扰
+        let _guard = ENV_LOCK.lock();
+        let old = std::env::var_os("CZ_DATA_ROOT");
+        std::env::set_var("CZ_DATA_ROOT", &root);
+
+        let p = Paths::resolve().unwrap();
+        assert_eq!(p.roaming, root.join("roaming"));
+        assert_eq!(p.local, root.join("local"));
+
+        match old {
+            Some(v) => std::env::set_var("CZ_DATA_ROOT", v),
+            None => std::env::remove_var("CZ_DATA_ROOT"),
+        }
+    }
+
+    #[test]
+    fn empty_data_root_falls_back_to_system_dirs() {
+        let _guard = ENV_LOCK.lock();
+        let old = std::env::var_os("CZ_DATA_ROOT");
+        std::env::set_var("CZ_DATA_ROOT", "");
+
+        let p = Paths::resolve().unwrap();
+        // 空串必须被忽略，回落到真实系统目录（以 ClashZhengl 结尾）
+        assert!(
+            p.roaming.ends_with(APP_DIR_NAME),
+            "空覆盖值不应生效，实际 {}",
+            p.roaming.display()
+        );
+
+        match old {
+            Some(v) => std::env::set_var("CZ_DATA_ROOT", v),
+            None => std::env::remove_var("CZ_DATA_ROOT"),
+        }
+    }
+
+    #[test]
     fn paths_layout_matches_contract() {
         let dir = tempfile::tempdir().unwrap();
         let p = Paths::with_roots(dir.path().join("roaming"), dir.path().join("local"));
@@ -303,6 +376,8 @@ mod tests {
         assert!(p.runtime_config().ends_with(Path::new("runtime").join("config.yaml")));
         assert!(p.sysproxy_journal().ends_with("sysproxy.journal.json"));
         assert!(p.switch_history().ends_with("switch-history.json"));
+        assert!(p.rules_file().ends_with("rules.json"));
+        assert!(p.traffic_stats_file().ends_with("traffic-stats.json"));
         assert!(p.core_binary("v1.19.33").ends_with(Path::new("v1.19.33").join("mihomo.exe")));
     }
 }

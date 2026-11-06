@@ -3,6 +3,7 @@
 pub mod app_cmd;
 pub mod dto;
 pub mod node_cmd;
+pub mod rule_cmd;
 pub mod state;
 pub mod sub_cmd;
 
@@ -40,13 +41,27 @@ pub fn register_handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync 
         // ---- subscription ----
         sub_cmd::subscription_list,
         sub_cmd::subscription_add,
+        sub_cmd::subscription_add_ex,
         sub_cmd::subscription_remove,
         sub_cmd::subscription_update,
+        sub_cmd::subscription_update_meta,
+        sub_cmd::subscription_reveal_password,
         sub_cmd::subscription_fetch,
         sub_cmd::subscription_fetch_all,
         sub_cmd::subscription_traffic,
         sub_cmd::subscription_apply,
         sub_cmd::subscription_preview_config,
+        // ---- rule（v3）----
+        rule_cmd::rule_list,
+        rule_cmd::rule_add,
+        rule_cmd::rule_update,
+        rule_cmd::rule_remove,
+        rule_cmd::rule_reorder,
+        // ---- traffic / mode（v3）----
+        rule_cmd::traffic_stats,
+        rule_cmd::traffic_reset_today,
+        rule_cmd::mode_get,
+        rule_cmd::mode_set,
         // ---- node / speedtest / switch ----
         node_cmd::node_groups,
         node_cmd::node_select,

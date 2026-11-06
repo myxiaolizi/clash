@@ -523,6 +523,12 @@ mod tests {
         fn version(&self) -> ApiFuture<'_, String> {
             Box::pin(async { Ok("v1.19.33".into()) })
         }
+        fn traffic_totals(&self) -> ApiFuture<'_, crate::kernel::api::TrafficTotals> {
+            Box::pin(async { Ok(crate::kernel::api::TrafficTotals::default()) })
+        }
+        fn connection_count(&self) -> ApiFuture<'_, usize> {
+            Box::pin(async { Ok(0) })
+        }
     }
 
     fn engine(api: Arc<dyn SelectorApi>) -> (Arc<SpeedtestEngine>, Arc<SwitchHistoryStore>) {

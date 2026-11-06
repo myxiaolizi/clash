@@ -25,36 +25,52 @@ public sealed class DaemonException : Exception
         Retryable = retryable;
     }
 
-    /// <summary>把错误码翻译成给用户看的中文提示（对照 C.6 错误表）。</summary>
-    public string FriendlyMessage => Code switch
-    {
-        "E_NET_OFFLINE" => "网络不可用，请检查连接",
-        "E_NET_TIMEOUT" => "网络请求超时",
-        "E_NET_DNS" => "域名解析失败",
-        "E_NET_TLS" => "TLS 握手失败",
-        "E_NET_PROXY" => "代理不可用",
-        "E_HTTP_STATUS" => "服务器返回错误",
-        "E_SUB_URL_INVALID" => "订阅链接无效",
-        "E_SUB_EMPTY" => "订阅内容为空",
-        "E_PARSE_YAML" => "订阅格式无法解析",
-        "E_PARSE_EMPTY" => "订阅里没有可用节点",
-        "E_USERINFO_MISSING" => "订阅未提供流量信息",
-        "E_NO_SUBSCRIPTION" => "还没有添加订阅",
-        "E_CORE_NOT_RUNNING" => "内核未运行",
-        "E_CORE_CRASHED" => "内核意外退出",
-        "E_CORE_DOWNLOAD" => "内核下载失败",
-        "E_CORE_VERIFY" => "内核校验失败",
-        "E_SWITCH_GROUP_MISSING" => "节点组不存在",
-        "E_SWITCH_NODE_MISSING" => "节点不存在",
-        "E_SPEEDTEST_RUNNING" => "测速正在进行中",
-        "E_SPEEDTEST_NO_NODE" => "没有可测速的节点",
-        "E_SYSPROXY_SET" => "设置系统代理失败",
-        "E_SYSPROXY_VERIFY" => "系统代理设置未生效",
-        "E_BUSY" => "操作正在进行中",
-        "E_CANCELLED" => "操作已取消",
-        "E_UNAUTHORIZED" => "内部鉴权失败，请重启应用",
-        _ => Message,
-    };
+    /// <summary>
+    /// 是否为「后端还没实现这个命令」。
+    ///
+    /// daemon 对未注册的命令返回 <c>E_INTERNAL</c> + message「未知命令: xxx」。
+    /// 0.1.1 起前后端并行开发，前端会先调一批后端尚未落地的命令，
+    /// 页面必须靠这个判断优雅降级成「功能开发中」，而不是整页报红。
+    /// </summary>
+    public bool IsUnknownCommand
+        => Code == "E_INTERNAL"
+           && (Message.Contains("未知命令", StringComparison.Ordinal)
+               || Message.Contains("unknown command", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// 把错误码翻译成给用户看的中文提示（对照 C.6 错误表）。
+    /// </summary>
+    public string FriendlyMessage => IsUnknownCommand
+        ? "该功能在当前版本的内核服务中尚未实现"
+        : Code switch
+        {
+            "E_NET_OFFLINE" => "网络不可用，请检查连接",
+            "E_NET_TIMEOUT" => "网络请求超时",
+            "E_NET_DNS" => "域名解析失败",
+            "E_NET_TLS" => "TLS 握手失败",
+            "E_NET_PROXY" => "代理不可用",
+            "E_HTTP_STATUS" => "服务器返回错误",
+            "E_SUB_URL_INVALID" => "订阅链接无效",
+            "E_SUB_EMPTY" => "订阅内容为空",
+            "E_PARSE_YAML" => "订阅格式无法解析",
+            "E_PARSE_EMPTY" => "订阅里没有可用节点",
+            "E_USERINFO_MISSING" => "订阅未提供流量信息",
+            "E_NO_SUBSCRIPTION" => "还没有添加订阅",
+            "E_CORE_NOT_RUNNING" => "内核未运行",
+            "E_CORE_CRASHED" => "内核意外退出",
+            "E_CORE_DOWNLOAD" => "内核下载失败",
+            "E_CORE_VERIFY" => "内核校验失败",
+            "E_SWITCH_GROUP_MISSING" => "节点组不存在",
+            "E_SWITCH_NODE_MISSING" => "节点不存在",
+            "E_SPEEDTEST_RUNNING" => "测速正在进行中",
+            "E_SPEEDTEST_NO_NODE" => "没有可测速的节点",
+            "E_SYSPROXY_SET" => "设置系统代理失败",
+            "E_SYSPROXY_VERIFY" => "系统代理设置未生效",
+            "E_BUSY" => "操作正在进行中",
+            "E_CANCELLED" => "操作已取消",
+            "E_UNAUTHORIZED" => "内部鉴权失败，请重启应用",
+            _ => Message,
+        };
 }
 
 /// <summary>
@@ -154,6 +170,11 @@ public sealed class DaemonClient : IAsyncDisposable
             RedirectStandardError = true,
             WorkingDirectory = Path.GetDirectoryName(exe)!,
         };
+
+        // 把自己的 PID 传给 daemon，让它能监视我们。
+        // GUI 被强杀（任务管理器结束、崩溃）时来不及发 /shutdown，
+        // daemon 靠这个值发现父进程已消失并自行退出，否则会变成孤儿进程占着端口和内核。
+        psi.Environment["CZ_PARENT_PID"] = Environment.ProcessId.ToString();
 
         _ownedProcess = Process.Start(psi)
             ?? throw new DaemonException("E_INTERNAL", "无法启动内核服务进程", null, false);
@@ -428,6 +449,13 @@ public sealed class DaemonClient : IAsyncDisposable
             catch (Exception e)
             {
                 Log.Warn($"事件流断开，{backoff.TotalSeconds:0} 秒后重连：{e.Message}");
+
+                // 连续断线说明 daemon 可能真的没了，尝试把它拉起来。
+                // 放在这里是因为事件流是常驻长连接，它的断开是最灵敏的探针。
+                if (backoff >= TimeSpan.FromSeconds(4))
+                {
+                    await TryRecoverAsync(ct).ConfigureAwait(false);
+                }
             }
 
             try
@@ -444,30 +472,110 @@ public sealed class DaemonClient : IAsyncDisposable
     }
 
     // ========================================================================
+    //  自动恢复
+    // ========================================================================
+
+    private int _recovering;   // 0/1，用 Interlocked 保证只有一个恢复流程在跑
+
+    /// <summary>daemon 恢复连接后触发，供上层重新加载各页面数据。</summary>
+    public event Func<Task>? Recovered;
+
+    /// <summary>
+    /// 被 GUI 自己拉起的 daemon 意外退出时，重新拉起它。
+    ///
+    /// 为什么需要：daemon 是独立进程，可能因为内部 panic、被任务管理器结束、
+    /// 或系统资源紧张而消失。它的父进程监视只在 **GUI 消失** 时生效，
+    /// 反方向（daemon 先没了）没有任何机制——结果就是界面一直转圈报
+    /// 「无法连接内核服务」，用户只能手动重启整个程序。
+    ///
+    /// 这里做最小恢复：重新走一次 EnsureStartedAsync，成功则通知上层刷新。
+    /// 只对**我们自己的** daemon 生效；复用别人的 daemon 时不去动它。
+    ///
+    /// 返回 true 表示已重新连上。
+    /// </summary>
+    public async Task<bool> TryRecoverAsync(CancellationToken ct = default)
+    {
+        if (_stopping) return false;                     // 正在退出，别往回拉
+        if (Interlocked.Exchange(ref _recovering, 1) == 1)
+            return false; // 已有恢复流程在跑
+
+        try
+        {
+            Log.Warn("daemon 已失联，尝试重新拉起");
+
+            // 旧进程对象可能已退出，先清掉
+            try
+            {
+                if (_ownedProcess is { HasExited: true })
+                {
+                    _ownedProcess.Dispose();
+                    _ownedProcess = null;
+                }
+            }
+            catch { }
+
+            _port = 0;
+            _token = "";
+
+            await EnsureStartedAsync(null, ct).ConfigureAwait(false);
+            Log.Info($"daemon 已恢复 port={_port}");
+
+            var handler = Recovered;
+            if (handler is not null)
+            {
+                try { await handler().ConfigureAwait(false); }
+                catch (Exception e) { Log.Warn($"恢复后刷新页面失败：{e.Message}"); }
+            }
+
+            return _port > 0;
+        }
+        catch (Exception e)
+        {
+            Log.Error("daemon 恢复失败", e);
+            return false;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _recovering, 0);
+        }
+    }
+
+    // ========================================================================
     //  停止
     // ========================================================================
 
     /// <summary>
     /// 停止 daemon。只终止**本进程启动的** daemon；
     /// 复用别人启动的 daemon 时不杀（用户可能还有别的窗口在用）。
+    ///
+    /// 优先走 <c>POST /shutdown</c> 让它自己优雅退出：daemon 会还原系统代理、
+    /// 停掉 mihomo、刷盘。0.1.0 用的 <c>CloseMainWindow()</c> 对无窗口的控制台
+    /// 进程毫无作用，等于等 3 秒后直接 Kill —— 系统代理设置会残留在注册表里，
+    /// mihomo 也可能变成孤儿占着端口。
     /// </summary>
     public async Task StopOwnedAsync()
     {
         if (_ownedProcess is null) return;
 
+        _stopping = true;   // 告诉重连逻辑别再往回拉
+
         try
         {
             if (!_ownedProcess.HasExited)
             {
-                // 先礼后兵：给它 3 秒自己清理（关系统代理、停内核）
-                _ownedProcess.CloseMainWindow();
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                // 1) 优雅停机：POST /shutdown（无 body，需 Bearer）
+                var graceful = await TryShutdownAsync().ConfigureAwait(false);
+
+                // 2) 等它自己收尾；给足 8 秒（要关系统代理 + 停内核）
+                using var cts = new CancellationTokenSource(
+                    TimeSpan.FromSeconds(graceful ? 8 : 3));
                 try
                 {
                     await _ownedProcess.WaitForExitAsync(cts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
+                    Log.Warn("daemon 未在超时内退出，强制结束");
                     _ownedProcess.Kill(entireProcessTree: true);
                 }
             }
@@ -480,6 +588,37 @@ public sealed class DaemonClient : IAsyncDisposable
         {
             _ownedProcess.Dispose();
             _ownedProcess = null;
+        }
+    }
+
+    private bool _stopping;
+
+    /// <summary>POST /shutdown。已连上并成功受理返回 true。</summary>
+    private async Task<bool> TryShutdownAsync()
+    {
+        if (_port <= 0 || string.IsNullOrWhiteSpace(_token)) return false;
+
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post,
+                $"http://127.0.0.1:{_port}/shutdown");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            using var resp = await _http.SendAsync(req, cts.Token).ConfigureAwait(false);
+
+            if (resp.IsSuccessStatusCode)
+            {
+                Log.Info("已请求 daemon 优雅退出");
+                return true;
+            }
+            Log.Warn($"daemon 停机请求返回 {(int)resp.StatusCode}");
+            return false;
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"请求 daemon 停机失败：{e.Message}");
+            return false;
         }
     }
 

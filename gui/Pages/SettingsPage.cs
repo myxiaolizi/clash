@@ -15,6 +15,11 @@ public sealed class SettingsPage
     private Settings? _settings;
     private bool _loading;
 
+    /// <summary>内核状态行的文本控件，供事件驱动局部刷新用。</summary>
+    private TextBlock? _coreStatusText;
+
+    private CoreStatus _core = new();
+
     public Settings? Settings => _settings;
 
     public SettingsPage(StackPanel host) => _host = host;
@@ -22,8 +27,8 @@ public sealed class SettingsPage
     public async Task InitializeAsync(Settings settings)
     {
         _settings = settings;
+        await LoadCoreStatusAsync();
         Render();
-        await Task.CompletedTask;
     }
 
     public async Task RefreshAsync()
@@ -31,6 +36,7 @@ public sealed class SettingsPage
         try
         {
             _settings = await App.Daemon.CallAsync<Settings>("settings_get");
+            await LoadCoreStatusAsync();
             Render();
         }
         catch (DaemonException e)
@@ -43,6 +49,60 @@ public sealed class SettingsPage
                 Foreground = (Brush)Application.Current.Resources["BadBrush"],
             });
         }
+    }
+
+    /// <summary>
+    /// 拉取内核真实状态。
+    ///
+    /// 0.1.1 修复：0.1.0 用 <c>settings.core_version</c> 判断内核是否存在，
+    /// 但那个字段只在用户手动选过版本时才有值，一直是 null，
+    /// 于是明明装好了内核也显示「未安装内核」。
+    /// 现在看 core_status 的 <c>installed</c>（磁盘上真有二进制），与配置无关。
+    /// </summary>
+    private async Task LoadCoreStatusAsync()
+    {
+        try
+        {
+            var st = await App.Daemon.CallAsync<CoreStatus>("core_status");
+            if (st is not null) _core = st;
+        }
+        catch (DaemonException e)
+        {
+            Log.Warn($"读取内核状态失败：{e.FriendlyMessage}");
+        }
+    }
+
+    /// <summary>内核安装/状态事件，由 MainWindow 转发。</summary>
+    public void OnCoreEvent(string name, System.Text.Json.JsonElement data)
+    {
+        try
+        {
+            if (data.TryGetProperty("state", out var s) && s.ValueKind == System.Text.Json.JsonValueKind.String)
+                _core.State = s.GetString() ?? _core.State;
+            if (data.TryGetProperty("installed", out var inst) &&
+                (inst.ValueKind == System.Text.Json.JsonValueKind.True ||
+                 inst.ValueKind == System.Text.Json.JsonValueKind.False))
+                _core.Installed = inst.GetBoolean();
+
+            _ = RefreshCoreRowAsync();
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"处理内核事件失败：{e.Message}");
+        }
+    }
+
+    /// <summary>只刷新内核状态那一行，不整页重建（避免打断用户正在操作的控件）。</summary>
+    private async Task RefreshCoreRowAsync()
+    {
+        await LoadCoreStatusAsync();
+        if (_coreStatusText is null) return;
+
+        _coreStatusText.Text = _core.DisplayText;
+        _coreStatusText.Foreground = (Brush)Application.Current.Resources[
+            _core.Running ? "GoodBrush"
+            : _core.State == "failed" ? "BadBrush"
+            : "TextSecondaryBrush"];
     }
 
     private void Render()
@@ -150,31 +210,39 @@ public sealed class SettingsPage
         sp.Children.Add(Row("启动时自动运行内核", "关闭后需要手动点「启动内核」", startToggle));
 
         // 内核状态 + 重启按钮
-        var statusText = new TextBlock
+        //
+        // 「未安装」必须依据 core_status.installed（磁盘上有没有二进制），
+        // 不能再看 settings.coreVersion —— 用户没手动选过版本时它恒为 null。
+        _coreStatusText = new TextBlock
         {
-            Text = s.CoreVersion is { Length: > 0 } cv ? $"当前版本 {cv}" : "未安装内核",
+            Text = _core.DisplayText,
             FontSize = 12.5,
-            Foreground = (Brush)Application.Current.Resources["TextSecondaryBrush"],
+            Foreground = (Brush)Application.Current.Resources[
+                _core.Running ? "GoodBrush"
+                : _core.State == "failed" ? "BadBrush"
+                : "TextSecondaryBrush"],
             VerticalAlignment = VerticalAlignment.Center,
         };
 
-        var btnRestart = new Button { Content = "重启内核", FontSize = 12.5 };
+        var btnRestart = new Button { Content = "重启内核", FontSize = 12.5, IsEnabled = _core.InstalledOrRunning };
         btnRestart.Click += async (_, _) =>
         {
             btnRestart.IsEnabled = false;
             btnRestart.Content = "重启中…";
             try
             {
-                await App.Daemon.CallAsync("core_restart", timeoutSec: 60);
-                await RefreshAsync();
+                var st = await App.Daemon.CallAsync<CoreStatus>("core_restart", timeoutSec: 60);
+                if (st is not null) _core = st;
+                await RefreshCoreRowAsync();
             }
             catch (DaemonException e)
             {
                 Log.Error($"重启内核失败：{e.FriendlyMessage}");
+                await ShowInfoAsync(e.FriendlyMessage);
             }
             finally
             {
-                btnRestart.IsEnabled = true;
+                btnRestart.IsEnabled = _core.InstalledOrRunning;
                 btnRestart.Content = "重启内核";
             }
         };
@@ -185,9 +253,11 @@ public sealed class SettingsPage
             Spacing = 10,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
-        coreRow.Children.Add(statusText);
+        coreRow.Children.Add(_coreStatusText);
         coreRow.Children.Add(btnRestart);
-        sp.Children.Add(Row("内核状态", null, coreRow));
+        sp.Children.Add(Row("内核状态",
+            _core.InstalledOrRunning ? null : "请先安装内核后再使用代理功能",
+            coreRow));
 
         // 打开目录
         var btnData = new Button { Content = "打开数据目录", FontSize = 12.5 };
@@ -235,7 +305,7 @@ public sealed class SettingsPage
 
         var enableToggle = Toggle(s.SwitchPolicy.Enabled, async v =>
         {
-            await PatchAsync(new { switchPolicy = new { enabled = v } });
+            await PatchPolicyAsync(p => p.Enabled = v);
         });
         sp.Children.Add(Row("启用自动切换", null, enableToggle));
 
@@ -277,10 +347,7 @@ public sealed class SettingsPage
         toleranceBox.ValueChanged += async (_, e) =>
         {
             if (_loading) return;
-            await PatchAsync(new
-            {
-                switchPolicy = new { toleranceMs = (int)e.NewValue },
-            });
+            await PatchPolicyAsync(p => p.ToleranceMs = (int)e.NewValue);
         };
         sp.Children.Add(Row("切换容差", "新节点比当前快多少毫秒才切换", toleranceBox));
 
@@ -297,14 +364,35 @@ public sealed class SettingsPage
         dwellBox.ValueChanged += async (_, e) =>
         {
             if (_loading) return;
-            await PatchAsync(new
-            {
-                switchPolicy = new { minDwellSec = (int)(e.NewValue * 60) },
-            });
+            await PatchPolicyAsync(p => p.MinDwellSec = (int)(e.NewValue * 60));
         };
         sp.Children.Add(Row("最短驻留时间", "切过去后至少多久不再切换（分钟）", dwellBox));
 
         return card;
+    }
+
+    /// <summary>
+    /// 修改自动切换策略的单个字段。
+    ///
+    /// ⚠ 必须传**完整的** PolicyDto：Rust 的 <c>SettingsPatch.switch_policy</c>
+    /// 是 <c>Option&lt;PolicyDto&gt;</c>，而 PolicyDto 里 toleranceMs / minDwellSec /
+    /// failureThreshold 等字段没有 serde default。只传 <c>{ enabled = true }</c>
+    /// 会被反序列化直接拒绝，报「参数不合法: missing field `toleranceMs`」——
+    /// 0.1.0 的四个策略开关其实一个都没保存成功过。
+    ///
+    /// 这里先克隆当前策略，改一个字段，再整体回传。
+    /// </summary>
+    private async Task PatchPolicyAsync(Action<SwitchPolicy> mutate)
+    {
+        if (_settings is null) return;
+
+        var next = _settings.SwitchPolicy.Clone();
+        mutate(next);
+
+        var updated = await App.Daemon.CallAsync<Settings>("settings_update",
+            new { switchPolicy = next });
+
+        _settings = updated;
     }
 
     // ========================================================================
@@ -339,7 +427,7 @@ public sealed class SettingsPage
         });
         textSp.Children.Add(new TextBlock
         {
-            Text = "版本 0.1.0 · WinUI 3",
+            Text = "版本 0.1.1 · WinUI 3",
             FontSize = 11.5,
             Foreground = (Brush)Application.Current.Resources["TextTertiaryBrush"],
         });
@@ -470,5 +558,18 @@ public sealed class SettingsPage
     public void PersistCurrentSize()
     {
         // 尺寸由 MainWindow 的 AppWindow.Changed 自动保存，这里仅保留钩子
+    }
+
+    private async Task ShowInfoAsync(string msg)
+    {
+        if (_host.XamlRoot is null) return;
+        var dlg = new ContentDialog
+        {
+            XamlRoot = _host.XamlRoot,
+            Title = "提示",
+            Content = msg,
+            CloseButtonText = "知道了",
+        };
+        try { await dlg.ShowAsync(); } catch { }
     }
 }

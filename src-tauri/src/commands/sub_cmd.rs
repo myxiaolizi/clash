@@ -7,6 +7,7 @@ use tauri::State;
 use crate::commands::dto::*;
 use crate::commands::state::AppHandleState;
 use crate::domain::errors::{AppError, AppResult, ErrorCode};
+use crate::subscription::manager::SubMetaInput;
 
 type R<T> = Result<T, IpcError>;
 
@@ -34,6 +35,48 @@ pub async fn subscription_add_inner(s: &Arc<crate::commands::state::AppState>, n
 #[tauri::command]
 pub async fn subscription_add(state: State<'_, AppHandleState>, name: String, url: String) -> R<SubscriptionDto> {
     subscription_add_inner(&state.0, name, url).await.map_err(IpcError::from)
+}
+
+
+/// 新增订阅（带管理信息）
+pub async fn subscription_add_ex_inner(
+    s: &Arc<crate::commands::state::AppState>,
+    name: String,
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+    homepage: Option<String>,
+    remark: Option<String>,
+) -> AppResult<SubscriptionDto> {
+    let meta = SubMetaInput {
+        username,
+        password,
+        homepage,
+        remark,
+    };
+    let sub = s.subs.add_with_meta(&name, &url, meta)?;
+    s.emit(
+        "subscription:added",
+        serde_json::json!({"uid": sub.uid, "name": sub.name}),
+    );
+    Ok(SubscriptionDto::from(&sub))
+}
+
+#[tauri::command]
+pub async fn subscription_add_ex(
+    state: State<'_, AppHandleState>,
+    name: String,
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+    homepage: Option<String>,
+    remark: Option<String>,
+) -> R<SubscriptionDto> {
+    subscription_add_ex_inner(
+        &state.0, name, url, username, password, homepage, remark,
+    )
+    .await
+    .map_err(IpcError::from)
 }
 
 
@@ -74,6 +117,72 @@ pub async fn subscription_update(state: State<'_, AppHandleState>, uid: String, 
 }
 
 
+/// 更新订阅的管理信息（用户名 / 密码 / 机场地址 / 备注）。
+///
+/// 语义：参数缺席 = 保持原值；传空串 = 清空该字段。
+/// 密码**只进不出**：本命令从不返回密码明文。
+pub async fn subscription_update_meta_inner(
+    s: &Arc<crate::commands::state::AppState>,
+    uid: String,
+    username: Option<String>,
+    password: Option<String>,
+    homepage: Option<String>,
+    remark: Option<String>,
+) -> AppResult<SubscriptionDto> {
+    let meta = SubMetaInput {
+        username,
+        password,
+        homepage,
+        remark,
+    };
+    let sub = s.subs.update_meta(&uid, meta)?;
+    Ok(SubscriptionDto::from(&sub))
+}
+
+#[tauri::command]
+pub async fn subscription_update_meta(
+    state: State<'_, AppHandleState>,
+    uid: String,
+    username: Option<String>,
+    password: Option<String>,
+    homepage: Option<String>,
+    remark: Option<String>,
+) -> R<SubscriptionDto> {
+    subscription_update_meta_inner(&state.0, uid, username, password, homepage, remark)
+        .await
+        .map_err(IpcError::from)
+}
+
+
+/// 取订阅的机场登录密码明文（用户点「显示密码」时才调用）。
+///
+/// 单独开一个命令而不是塞进 `SubscriptionDto`：DTO 会被 list 命令
+/// 一次性批量返回并常驻前端内存/日志，密码一旦进去就收不回来了。
+pub async fn subscription_reveal_password_inner(
+    s: &Arc<crate::commands::state::AppState>,
+    uid: String,
+) -> AppResult<String> {
+    let sub = s
+        .subs_store
+        .get(&uid)
+        .ok_or_else(|| AppError::new(ErrorCode::NotFound))?;
+    if sub.password_cipher.trim().is_empty() {
+        return Ok(String::new());
+    }
+    crate::store::crypto::unprotect(&sub.password_cipher)
+}
+
+#[tauri::command]
+pub async fn subscription_reveal_password(
+    state: State<'_, AppHandleState>,
+    uid: String,
+) -> R<String> {
+    subscription_reveal_password_inner(&state.0, uid)
+        .await
+        .map_err(IpcError::from)
+}
+
+
 /// 拉取单个订阅
 pub async fn subscription_fetch_inner(s: &Arc<crate::commands::state::AppState>, uid: String, force: Option<bool>) -> AppResult<SubscriptionDto> {
     
@@ -95,6 +204,29 @@ pub async fn subscription_fetch_inner(s: &Arc<crate::commands::state::AppState>,
             "nodeCount": parsed.node_count(),
         }),
     );
+
+    // ★ 关键修复：拉取成功必须立刻重建配置并热重载内核。
+    //
+    // 早期只在 `subscription_apply` 里做这一步，用户加完订阅点"更新"
+    // 之后界面显示"已更新 N 个节点"，但节点列表是空的 ——
+    // 因为 runtime/config.yaml 还是上一次的内容，内核压根没拿到新节点。
+    // 内核未运行时静默跳过（下次 start_core 会用最新缓存重建）。
+    if let Err(e) = apply_config_inner(s).await {
+        // 不能让"配置应用失败"把"拉取成功"变成错误：
+        // 用户至少该看到节点数已更新，配置问题在事件里提示。
+        tracing::warn!(err = %e, "订阅拉取成功但配置应用失败");
+        s.emit(
+            "subscription:applyFailed",
+            serde_json::json!({
+                "uid": uid,
+                "code": e.code.as_str(),
+                "message": e.message,
+            }),
+        );
+    }
+
+    // 重新读一次：应用配置过程中订阅索引可能被更新过
+    let sub = s.subs_store.get(&uid).unwrap_or(sub);
     Ok(SubscriptionDto::from(&sub))
 }
 
@@ -117,10 +249,26 @@ pub async fn subscription_fetch_all_inner(s: &Arc<crate::commands::state::AppSta
         serde_json::json!({"total": total, "ok": ok, "failed": failed}),
     );
 
+    // 同 `subscription_fetch`：有任何一个成功就要让内核看到新节点
+    let mut apply_note = String::new();
+    if ok > 0 {
+        if let Err(e) = apply_config_inner(s).await {
+            tracing::warn!(err = %e, "全部更新后配置应用失败");
+            s.emit(
+                "subscription:applyFailed",
+                serde_json::json!({
+                    "code": e.code.as_str(),
+                    "message": e.message,
+                }),
+            );
+            apply_note = format!("；配置未生效：{}", e.message);
+        }
+    }
+
     let msg = if failed == 0 {
-        format!("已更新 {ok} 个订阅")
+        format!("已更新 {ok} 个订阅{apply_note}")
     } else {
-        format!("更新完成：成功 {ok}，失败 {failed}")
+        format!("更新完成：成功 {ok}，失败 {failed}{apply_note}")
     };
     Ok(OpResultDto { ok: failed == 0, message: msg })
 }
@@ -143,22 +291,37 @@ pub async fn subscription_traffic(state: State<'_, AppHandleState>) -> R<Traffic
 }
 
 
-/// 手动应用当前配置到内核（无需等定时任务）
-pub async fn subscription_apply_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
-    
-
+/// 重建配置并让内核热重载。
+///
+/// 这是「生成 → 落盘 → 热重载」的唯一实现，`subscription_apply`、
+/// `subscription_fetch`、`subscription_fetch_all` 以及规则变更都走它，
+/// 避免出现"某条路径忘了重载"导致配置与内核不一致。
+///
+/// 内核未运行时返回 `Ok(None)` 语义的静默跳过由调用方判断 ——
+/// 这里直接返回 `Err(CoreNotRunning)`，让调用方决定是否忽略。
+pub async fn apply_config_inner(
+    s: &Arc<crate::commands::state::AppState>,
+) -> AppResult<usize> {
     let ports = s
         .kernel
         .actual_ports()
         .ok_or_else(|| AppError::new(ErrorCode::CoreNotRunning))?;
-    let secret = s.secret.read().clone();
-    if secret.is_empty() {
+
+    // secret 有两个来源：AppState 内存（已 attach）与 runtime/secret 文件。
+    // 优先用内存（权威），回退到文件（daemon 重启后可能还没 attach）。
+    let mut secret = s.secret.read().clone();
+    if secret.trim().is_empty() {
+        secret = std::fs::read_to_string(s.paths.secret_file())
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+    }
+    if secret.trim().is_empty() {
         return Err(AppError::new(ErrorCode::CoreApiUnauth));
     }
 
     let gen = s
         .subs
-        .build_config(ports.0, ports.1, &secret)
+        .build_config(ports.0, ports.1, secret.trim())
         ?
         .ok_or_else(|| AppError::new(ErrorCode::NoSubscription))?;
 
@@ -169,10 +332,13 @@ pub async fn subscription_apply_inner(s: &Arc<crate::commands::state::AppState>)
         "subscription:applied",
         serde_json::json!({"nodes": gen.node_names.len()}),
     );
-    Ok(OpResultDto::ok(format!(
-        "配置已生效，共 {} 个节点",
-        gen.node_names.len()
-    )))
+    Ok(gen.node_names.len())
+}
+
+/// 手动应用当前配置到内核（无需等定时任务）
+pub async fn subscription_apply_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    let nodes = apply_config_inner(s).await?;
+    Ok(OpResultDto::ok(format!("配置已生效，共 {nodes} 个节点")))
 }
 
 #[tauri::command]
@@ -208,7 +374,7 @@ mod tests {
     // 这里仅验证错误码传递不变形。
 
     use crate::commands::dto::IpcError;
-    use crate::domain::errors::{AppError, AppResult, ErrorCode};
+    use crate::domain::errors::{AppError, ErrorCode};
 
     #[test]
     fn ipc_error_preserves_code() {

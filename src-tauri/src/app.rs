@@ -73,6 +73,8 @@ pub async fn start_core(s: &Arc<AppState>) -> AppResult<()> {
                     main_group: crate::subscription::generator::MAIN_GROUP_DEFAULT.to_string(),
                     log_level: settings.log_level.to_mihomo(),
                     tun_enabled: matches!(settings.proxy_mode, ProxyMode::Tun),
+                    mihomo_mode: settings.mihomo_mode,
+                    user_rules: Vec::new(),
                 },
             )
             .map(|g| s.subs.write_config(&g))
@@ -133,11 +135,14 @@ fn write_placeholder_config(
     api_port: u16,
     secret: &str,
 ) -> AppResult<()> {
+    // 占位配置同样要遵守用户选的分流模式：否则用户在"全局"模式下
+    // 还没加订阅时看到的是规则模式行为，切换态与实际不符。
+    let mode = s.settings.get().mihomo_mode.as_str();
     let yaml = format!(
         "mixed-port: {mixed_port}\n\
          allow-lan: false\n\
          bind-address: 127.0.0.1\n\
-         mode: rule\n\
+         mode: {mode}\n\
          log-level: info\n\
          find-process-mode: strict\n\
          ipv6: true\n\
@@ -233,8 +238,11 @@ pub fn start_scheduler(s: &Arc<AppState>) {
         Arc::clone(&s.settings),
         Arc::clone(&s.kernel),
         speedtest,
+        Arc::clone(&s.traffic),
         tx,
     );
+    // 流量采集要用内核 API：内核已 attach 才给，否则保持 None
+    sched.set_api(s.api.read().clone());
     sched.spawn();
     *s.scheduler.write() = Some(sched);
     tracing::info!("调度器已装配");
@@ -331,7 +339,16 @@ async fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
             if let Err(e) = result {
                 tracing::warn!(err = %e, "托盘切换系统代理失败");
             }
-            let _ = app.emit("sysproxy:changed", serde_json::json!({}));
+            // 事件体必须带上真实状态，否则 GUI 收到空对象无法更新开关
+            let st = s.sysproxy.read_state();
+            let _ = app.emit(
+                "sysproxy:changed",
+                serde_json::json!({
+                    "enabled": st.enabled,
+                    "managedByUs": st.managed_by_us,
+                    "server": st.server,
+                }),
+            );
         }
         "restart_core" => {
             let _ = s.sysproxy.disable();

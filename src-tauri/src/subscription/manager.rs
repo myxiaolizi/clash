@@ -9,6 +9,7 @@ use crate::domain::model::{
     Subscription, SubscriptionMeta, UpdateStatus,
 };
 use crate::store::crypto;
+use crate::store::rules_store::RulesStore;
 use crate::store::settings_store::{SettingsStore, SubscriptionStore};
 use crate::subscription::fetch::{fetch_subscription, is_due, FetchOutcome};
 use crate::subscription::generator::{generate, GenerateInput, Generated, SubNodes};
@@ -21,6 +22,8 @@ pub struct SubscriptionManager {
     paths: Arc<Paths>,
     subs: Arc<SubscriptionStore>,
     settings: Arc<SettingsStore>,
+    /// 用户自定义规则库（生成配置时插入 rules 段）
+    rules: Arc<RulesStore>,
     /// 串行化「拉取 + 生成配置」，避免并发写 config.yaml
     fetch_lock: tokio::sync::Mutex<()>,
 }
@@ -30,11 +33,13 @@ impl SubscriptionManager {
         paths: Arc<Paths>,
         subs: Arc<SubscriptionStore>,
         settings: Arc<SettingsStore>,
+        rules: Arc<RulesStore>,
     ) -> Self {
         Self {
             paths,
             subs,
             settings,
+            rules,
             fetch_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -43,8 +48,20 @@ impl SubscriptionManager {
         self.subs.list()
     }
 
-    /// 新增订阅：校验 URL → DPAPI 加密 → 生成 uid → 落盘
+    /// 新增订阅（不带管理信息）：校验 URL → DPAPI 加密 → 生成 uid → 落盘
     pub fn add(&self, name: &str, url: &str) -> AppResult<Subscription> {
+        self.add_with_meta(name, url, SubMetaInput::default())
+    }
+
+    /// 新增订阅并写入管理信息（用户名/密码/机场地址/备注）。
+    ///
+    /// `meta` 里的密码在这里就加密，**明文绝不进内存之外的任何地方**。
+    pub fn add_with_meta(
+        &self,
+        name: &str,
+        url: &str,
+        meta: SubMetaInput,
+    ) -> AppResult<Subscription> {
         let name = name.trim();
         if name.is_empty() {
             return Err(AppError::msg(ErrorCode::InvalidArg, "订阅名称不能为空"));
@@ -67,8 +84,23 @@ impl SubscriptionManager {
 
         let mut sub = Subscription::new(uid, name.to_string(), cipher, hint, interval);
         sub.sort_order = sort_order;
+        apply_meta(&mut sub, &meta)?;
         self.subs.upsert(sub.clone())?;
         tracing::info!(uid = %sub.uid, name = %sub.name, "订阅已添加");
+        Ok(sub)
+    }
+
+    /// 更新订阅的管理信息（用户名 / 密码 / 机场地址 / 备注）
+    ///
+    /// 语义：`Some` 表示设置，`None` 表示保持原值；
+    /// 想清空某项就传 `Some("")`。密码传空串即清除密码。
+    pub fn update_meta(&self, uid: &str, meta: SubMetaInput) -> AppResult<Subscription> {
+        let mut sub = self
+            .subs
+            .get(uid)
+            .ok_or_else(|| AppError::new(ErrorCode::NotFound))?;
+        apply_meta(&mut sub, &meta)?;
+        self.subs.upsert(sub.clone())?;
         Ok(sub)
     }
 
@@ -324,6 +356,11 @@ impl SubscriptionManager {
             main_group: crate::subscription::generator::MAIN_GROUP_DEFAULT.to_string(),
             log_level: settings.log_level.to_mihomo(),
             tun_enabled: matches!(settings.proxy_mode, crate::domain::model::ProxyMode::Tun),
+            mihomo_mode: settings.mihomo_mode,
+            user_rules: self
+                .rules
+                .snapshot()
+                .to_mihomo_lines(crate::subscription::generator::MAIN_GROUP_DEFAULT),
         };
 
         let generated = generate(&input)?;
@@ -342,6 +379,81 @@ impl SubscriptionManager {
     pub fn traffic_summary(&self) -> crate::domain::model::TrafficSummary {
         crate::domain::model::TrafficSummary::build(&self.subs.list(), now_secs())
     }
+}
+
+/// 订阅管理信息的可选更新载荷。
+///
+/// 全部 `Option`：`None` = 保持原值，`Some("")` = 清空。
+/// 密码与其它字段分开处理——只有 `Some` 才重新加密，
+/// 这样前端只改备注时不必回传密码（也拿不到密码）。
+#[derive(Debug, Clone, Default)]
+pub struct SubMetaInput {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub homepage: Option<String>,
+    pub remark: Option<String>,
+}
+
+impl SubMetaInput {
+    pub fn is_empty(&self) -> bool {
+        self.username.is_none()
+            && self.password.is_none()
+            && self.homepage.is_none()
+            && self.remark.is_none()
+    }
+}
+
+/// 把管理信息写进订阅对象。密码在这里加密，明文只在栈上存活。
+fn apply_meta(sub: &mut Subscription, meta: &SubMetaInput) -> AppResult<()> {
+    if let Some(u) = &meta.username {
+        let t = u.trim();
+        sub.username = if t.is_empty() {
+            None
+        } else {
+            Some(crate::domain::errors::truncate(t, 128))
+        };
+    }
+    if let Some(h) = &meta.homepage {
+        let t = h.trim();
+        if t.is_empty() {
+            sub.homepage = None;
+        } else {
+            // 机场地址必须是 http/https：这一栏会被前端直接当链接打开，
+            // 放任 file:// 或 javascript: 会造成本地文件读取/脚本执行。
+            validate_homepage(t)?;
+            sub.homepage = Some(t.to_string());
+        }
+    }
+    if let Some(r) = &meta.remark {
+        let t = r.trim();
+        sub.remark = if t.is_empty() {
+            None
+        } else {
+            Some(crate::domain::errors::truncate(t, 200))
+        };
+    }
+    if let Some(p) = &meta.password {
+        if p.is_empty() {
+            sub.password_cipher = String::new();
+        } else {
+            sub.password_cipher = crypto::protect(p)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_homepage(url: &str) -> AppResult<()> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(AppError::msg(
+            ErrorCode::InvalidArg,
+            "机场地址必须以 http:// 或 https:// 开头",
+        ));
+    }
+    if url.len() > 512 {
+        return Err(AppError::msg(ErrorCode::InvalidArg, "机场地址过长"));
+    }
+    Ok(())
 }
 
 /// 生成 8 位 base32 uid（小写，无易混字符）
@@ -388,10 +500,10 @@ mod tests {
         ));
         std::fs::create_dir_all(paths.profiles_dir()).unwrap();
         std::fs::create_dir_all(paths.runtime_dir()).unwrap();
-
         let subs = Arc::new(SubscriptionStore::load(&paths).unwrap());
         let settings = Arc::new(SettingsStore::load(&paths).unwrap());
-        let mgr = SubscriptionManager::new(Arc::clone(&paths), subs, settings);
+        let rules = Arc::new(RulesStore::load(&paths).unwrap());
+        let mgr = SubscriptionManager::new(Arc::clone(&paths), subs, settings, rules);
         Env {
             _dir: dir,
             mgr,
@@ -548,5 +660,204 @@ proxies:
         let c = parse_subscription("proxies:\n  - name: x\n    type: ss\n").unwrap();
         let d = parse_subscription("proxies:\n  - name: y\n    type: ss\n").unwrap();
         assert!(!has_cross_duplicates(&[c, d]));
+    }
+
+    // ---- v3：订阅管理信息 ----
+
+    #[test]
+    fn add_with_meta_stores_encrypted_password() {
+        let e = setup();
+        let sub = e
+            .mgr
+            .add_with_meta(
+                "机场A",
+                "https://a.com/sub",
+                SubMetaInput {
+                    username: Some("user@example.com".into()),
+                    password: Some("P@ssw0rd!".into()),
+                    homepage: Some("https://a.com".into()),
+                    remark: Some("主力机场".into()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(sub.username.as_deref(), Some("user@example.com"));
+        assert_eq!(sub.homepage.as_deref(), Some("https://a.com"));
+        assert_eq!(sub.remark.as_deref(), Some("主力机场"));
+        assert!(sub.has_password());
+        assert!(
+            !sub.password_cipher.contains("P@ssw0rd!"),
+            "密码必须加密存储"
+        );
+
+        // 能解回明文（仅内部用）
+        let plain = crypto::unprotect(&sub.password_cipher).unwrap();
+        assert_eq!(plain, "P@ssw0rd!");
+    }
+
+    #[test]
+    fn update_meta_partial_does_not_clear_others() {
+        let e = setup();
+        let sub = e
+            .mgr
+            .add_with_meta(
+                "A",
+                "https://a.com/sub",
+                SubMetaInput {
+                    username: Some("u1".into()),
+                    password: Some("p1".into()),
+                    homepage: Some("https://a.com".into()),
+                    remark: Some("r1".into()),
+                },
+            )
+            .unwrap();
+
+        // 只改备注：用户名 / 密码 / 机场地址必须原样保留
+        let s2 = e
+            .mgr
+            .update_meta(
+                &sub.uid,
+                SubMetaInput {
+                    remark: Some("新备注".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(s2.remark.as_deref(), Some("新备注"));
+        assert_eq!(s2.username.as_deref(), Some("u1"));
+        assert_eq!(s2.homepage.as_deref(), Some("https://a.com"));
+        assert_eq!(
+            crypto::unprotect(&s2.password_cipher).unwrap(),
+            "p1",
+            "不传密码时密码不得丢失"
+        );
+    }
+
+    #[test]
+    fn update_meta_empty_string_clears_field() {
+        let e = setup();
+        let sub = e
+            .mgr
+            .add_with_meta(
+                "A",
+                "https://a.com/sub",
+                SubMetaInput {
+                    username: Some("u1".into()),
+                    password: Some("p1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let s2 = e
+            .mgr
+            .update_meta(
+                &sub.uid,
+                SubMetaInput {
+                    username: Some("".into()),
+                    password: Some("".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s2.username.is_none(), "空串应清空用户名");
+        assert!(!s2.has_password(), "空串应清空密码");
+    }
+
+    #[test]
+    fn homepage_must_be_http() {
+        let e = setup();
+        // file:// 与 javascript: 会被前端当链接打开，必须拒绝
+        for bad in ["file:///C:/Windows", "javascript:alert(1)", "ftp://a.com"] {
+            let r = e.mgr.add_with_meta(
+                "A",
+                "https://a.com/sub",
+                SubMetaInput {
+                    homepage: Some(bad.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(r.is_err(), "不得接受非 http(s) 地址: {bad}");
+        }
+        // 合法值可接受
+        assert!(e
+            .mgr
+            .add_with_meta(
+                "B",
+                "https://b.com/sub",
+                SubMetaInput {
+                    homepage: Some("https://b.com".into()),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
+    }
+
+    // ---- v3：用户规则进入配置 ----
+
+    #[test]
+    fn user_rules_injected_into_generated_config() {
+        let e = setup();
+        let s = e.mgr.add("机场A", "https://a.com/sub").unwrap();
+        e.mgr
+            .subs
+            .save_raw_yaml(
+                &s.uid,
+                b"proxies:\n  - name: n1\n    type: ss\n    server: a.com\n    port: 1\n",
+            )
+            .unwrap();
+
+        e.mgr
+            .rules
+            .add(
+                crate::domain::model::RuleKind::DomainSuffix,
+                "google.com",
+                crate::domain::model::RulePolicy::Proxy,
+                true,
+            )
+            .unwrap();
+        e.mgr
+            .rules
+            .add(
+                crate::domain::model::RuleKind::DomainKeyword,
+                "ads",
+                crate::domain::model::RulePolicy::Block,
+                true,
+            )
+            .unwrap();
+
+        let gen = e.mgr.build_config(10801, 49152, "sec").unwrap().unwrap();
+        assert!(
+            gen.yaml.contains("DOMAIN-SUFFIX,google.com,Proxy"),
+            "用户规则必须进配置:\n{}",
+            gen.yaml
+        );
+        assert!(gen.yaml.contains("DOMAIN-KEYWORD,ads,REJECT"));
+        assert!(gen.yaml.contains("MATCH,Proxy"));
+    }
+
+    #[test]
+    fn mihomo_mode_setting_flows_into_config() {
+        let e = setup();
+        let s = e.mgr.add("A", "https://a.com/sub").unwrap();
+        e.mgr
+            .subs
+            .save_raw_yaml(
+                &s.uid,
+                b"proxies:\n  - name: n1\n    type: ss\n    server: a.com\n    port: 1\n",
+            )
+            .unwrap();
+
+        // 默认 rule
+        let gen = e.mgr.build_config(10801, 49152, "s").unwrap().unwrap();
+        assert!(gen.yaml.contains("mode: rule"));
+
+        // 切成 global
+        e.mgr
+            .settings
+            .update(|x| x.mihomo_mode = crate::domain::model::MihomoMode::Global)
+            .unwrap();
+        let gen = e.mgr.build_config(10801, 49152, "s").unwrap().unwrap();
+        assert!(gen.yaml.contains("mode: global"), "全局模式必须写进配置");
     }
 }

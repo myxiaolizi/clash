@@ -136,12 +136,16 @@ fn gen_token() -> String {
 //  服务
 // ============================================================================
 
-/// 启动服务并返回监听端口。服务在后台任务中运行，直到 `shutdown` 被调用。
+/// 启动服务并返回监听端口。
+///
+/// `stop_tx` 是停机信号发送端：`POST /shutdown` 会向它发一次，
+/// `daemon.rs` 的 `wait_stop` 也在等同一个信号 —— 这样无论用户点
+/// "退出"（HTTP）还是 Ctrl+C，走的都是同一条优雅退出路径。
 pub async fn serve(
     state: Arc<AppState>,
     cfg: DaemonCfg,
     events_rx: broadcast::Receiver<crate::commands::state::AppEvent>,
-    mut stop_rx: broadcast::Receiver<()>,
+    stop_tx: broadcast::Sender<()>,
 ) -> AppResult<u16> {
     let token = gen_token();
     write_token(&cfg.paths, &token)?;
@@ -164,6 +168,7 @@ pub async fn serve(
     let accept_token = token.clone();
     let accept_state = Arc::clone(&state);
     let accept_sse = sse_tx.clone();
+    let accept_stop = stop_tx.clone();
 
     // accept 循环：每条连接独立 spawn，单连接阻塞不影响其它调用
     let accept = async move {
@@ -179,12 +184,14 @@ pub async fn serve(
             let st = Arc::clone(&accept_state);
             let tk = accept_token.clone();
             let sse = accept_sse.clone();
+            let sd = accept_stop.clone();
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let st = Arc::clone(&st);
                     let tk = tk.clone();
                     let sse = sse.clone();
-                    async move { Ok::<_, std::convert::Infallible>(route(st, tk, sse, req).await) }
+                    let sd = sd.clone();
+                    async move { Ok::<_, std::convert::Infallible>(route(st, tk, sse, sd, req).await) }
                 });
                 if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
@@ -198,6 +205,7 @@ pub async fn serve(
         }
     };
 
+    let mut stop_rx = stop_tx.subscribe();
     tokio::spawn(async move {
         tokio::select! {
             _ = accept => {}
@@ -242,6 +250,7 @@ async fn route(
     state: Arc<AppState>,
     token: String,
     sse_tx: broadcast::Sender<String>,
+    stop_tx: broadcast::Sender<()>,
     req: Request<Incoming>,
 ) -> Resp {
     let method = req.method().clone();
@@ -268,6 +277,22 @@ async fn route(
         (Method::GET, "/events") => {
             let rx = sse_tx.subscribe();
             sse_response(rx)
+        }
+
+        // ---- 优雅退出 ----
+        //
+        // GUI 退出时必须让 daemon 一起退出，否则 mihomo 会变成孤儿进程
+        // 继续占着 mixed-port，下次启动必然端口冲突。
+        // 约定：先回响应（让 GUI 知道收到了），再发停机信号。
+        (Method::POST, "/shutdown") => {
+            tracing::info!("收到 /shutdown 请求，准备退出");
+            let _ = state.events.send(crate::commands::state::AppEvent {
+                kind: "daemon:shutdown".into(),
+                payload: json!({}),
+                at: crate::util::time::now_secs(),
+            });
+            let _ = stop_tx.send(());
+            json_resp(StatusCode::OK, &json!({"ok": true, "data": {"shuttingDown": true}}))
         }
 
         // ---- 业务 RPC ----
@@ -327,7 +352,7 @@ fn sse_response(mut rx: broadcast::Receiver<String>) -> Resp {
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
     Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
+        .header("content-type", "text/event-stream; charset=utf-8")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
         .body(http_body_util::StreamBody::new(stream).map_err(|e| std::io::Error::other(e.to_string())).boxed())
@@ -360,7 +385,13 @@ fn json_resp(status: StatusCode, v: &Value) -> Resp {
     let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        // 必须显式声明 charset=utf-8。
+        //
+        // RFC 8259 规定 JSON 就是 UTF-8，本不该需要这个参数；但 Windows 的
+        // WinHTTP / HttpClient 在 Content-Type **没有 charset** 时会按
+        // ISO-8859-1 解码 —— 结果所有中文都变成 ????? 或乱码。
+        // 这个坑只在含非 ASCII 的响应上暴露，纯英文测试永远发现不了。
+        .header("content-type", "application/json; charset=utf-8")
         .body(full_body(Bytes::from(body)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }

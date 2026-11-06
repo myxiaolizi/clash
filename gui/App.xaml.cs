@@ -75,6 +75,9 @@ public partial class App : Application
             // 事件流常驻
             _ = _daemon.SubscribeEventsAsync(OnDaemonEvent, _lifetime.Token);
 
+            // daemon 意外退出后自动拉起，拉起成功后让主窗口重载数据
+            _daemon.Recovered += OnDaemonRecovered;
+
             await _window!.OnDaemonReadyAsync().ConfigureAwait(true);
         }
         catch (DaemonException e)
@@ -89,6 +92,21 @@ public partial class App : Application
         }
     }
 
+    /// <summary>daemon 重新连上后，把界面数据整体刷一遍。</summary>
+    private Task OnDaemonRecovered()
+    {
+        var w = _window;
+        if (w is null) return Task.CompletedTask;
+
+        w.DispatcherQueue.TryEnqueue(async () =>
+        {
+            try { await w.OnDaemonReadyAsync(); }
+            catch (Exception e) { Log.Warn($"恢复后刷新界面失败：{e.Message}"); }
+        });
+
+        return Task.CompletedTask;
+    }
+
     private Task OnDaemonEvent(string name, System.Text.Json.JsonElement data)
     {
         // 事件可能来自后台线程，必须切回 UI 线程再碰控件
@@ -98,8 +116,22 @@ public partial class App : Application
 
     private void OnWindowClosed(object sender, WindowEventArgs args)
     {
-        // 关闭按钮行为由 MainWindow 决定（最小化到托盘 or 真退出），
-        // 能走到这里说明是"真退出"
+        // 只有「真退出」才会走到这里。
+        //
+        // ⚠ 0.1.0 的 bug：自绘的关闭按钮直接调 Window.Close()，
+        // 而 Window.Close() **不会**触发 AppWindow.Closing，
+        // 于是 MainWindow 里「最小化到托盘」的拦截整段被绕过，
+        // 一路走到今天的 Closed → ShutdownAsync，托盘和 daemon 一起没了。
+        //
+        // 现在窗口按钮交给系统，系统的 × 一定先经过 AppWindow.Closing，
+        // 由设置决定是隐藏还是退出。这里再加一道保险：没被显式放行
+        // 就不做退出清理，避免以后有人又直接 Close() 把 daemon 带走。
+        if (sender is MainWindow w && !w.CloseAllowed)
+        {
+            Log.Warn("窗口在未放行的情况下被关闭，跳过退出清理（保留托盘与内核服务）");
+            return;
+        }
+
         _ = ShutdownAsync();
     }
 

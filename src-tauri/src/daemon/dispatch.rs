@@ -116,6 +116,19 @@ async fn call(state: Arc<AppState>, cmd: &str, args: Value) -> AppResult<Value> 
             let d = crate::commands::sub_cmd::subscription_add_inner(&state, name, url).await?;
             to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
         }
+        "subscription_add_ex" => {
+            let name = req_str(&args, "name")?;
+            let url = req_str(&args, "url")?;
+            let username = opt_str(&args, "username");
+            let password = opt_str(&args, "password");
+            let homepage = opt_str(&args, "homepage");
+            let remark = opt_str(&args, "remark");
+            let d = crate::commands::sub_cmd::subscription_add_ex_inner(
+                &state, name, url, username, password, homepage, remark,
+            )
+            .await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
         "subscription_remove" => {
             let uid = req_str(&args, "uid")?;
             crate::commands::sub_cmd::subscription_remove_inner(&state, uid).await?;
@@ -129,13 +142,29 @@ async fn call(state: Arc<AppState>, cmd: &str, args: Value) -> AppResult<Value> 
             let d = crate::commands::sub_cmd::subscription_update_inner(&state, uid, name, enabled, interval_min).await?;
             to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
         }
+        "subscription_update_meta" => {
+            let uid = req_str(&args, "uid")?;
+            let username = opt_str(&args, "username");
+            let password = opt_str(&args, "password");
+            let homepage = opt_str(&args, "homepage");
+            let remark = opt_str(&args, "remark");
+            let d = crate::commands::sub_cmd::subscription_update_meta_inner(
+                &state, uid, username, password, homepage, remark,
+            )
+            .await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "subscription_reveal_password" => {
+            let uid = req_str(&args, "uid")?;
+            let d = crate::commands::sub_cmd::subscription_reveal_password_inner(&state, uid).await?;
+            to_val(Value::String(d))
+        }
         "subscription_fetch" => {
             let uid = req_str(&args, "uid")?;
             let force = args.get("force").and_then(|v| v.as_bool());
             let d = crate::commands::sub_cmd::subscription_fetch_inner(&state, uid, force).await?;
             to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
-        }
-        "subscription_fetch_all" => {
+        }        "subscription_fetch_all" => {
             let d = crate::commands::sub_cmd::subscription_fetch_all_inner(&state).await?;
             to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
         }
@@ -149,6 +178,62 @@ async fn call(state: Arc<AppState>, cmd: &str, args: Value) -> AppResult<Value> 
         }
         "subscription_preview_config" => {
             let d = crate::commands::sub_cmd::subscription_preview_config_inner(&state).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+
+        // ==================== rule（v3）====================
+        "rule_list" => {
+            let d = crate::commands::rule_cmd::rule_list_inner(&state).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "rule_add" => {
+            let kind = req_str(&args, "kind")?;
+            let value = req_str(&args, "value")?;
+            let policy = req_str(&args, "policy")?;
+            let enabled = args.get("enabled").and_then(|v| v.as_bool());
+            let d = crate::commands::rule_cmd::rule_add_inner(&state, kind, value, policy, enabled).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "rule_update" => {
+            let id = req_str(&args, "id")?;
+            let kind = opt_str(&args, "kind");
+            let value = opt_str(&args, "value");
+            let policy = opt_str(&args, "policy");
+            let enabled = args.get("enabled").and_then(|v| v.as_bool());
+            let d = crate::commands::rule_cmd::rule_update_inner(&state, id, kind, value, policy, enabled).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "rule_remove" => {
+            let id = req_str(&args, "id")?;
+            let d = crate::commands::rule_cmd::rule_remove_inner(&state, id).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "rule_reorder" => {
+            let ids: Vec<String> = args
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .ok_or_else(|| AppError::msg(ErrorCode::Internal, "缺少参数 ids"))?;
+            let d = crate::commands::rule_cmd::rule_reorder_inner(&state, ids).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+
+        // ==================== traffic / mode（v3）====================
+        "traffic_stats" => {
+            let d = crate::commands::rule_cmd::traffic_stats_inner(&state).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "traffic_reset_today" => {
+            let d = crate::commands::rule_cmd::traffic_reset_today_inner(&state).await?;
+            to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
+        }
+        "mode_get" => {
+            let d = crate::commands::rule_cmd::mode_get_inner(&state).await?;
+            to_val(Value::String(d))
+        }
+        "mode_set" => {
+            let mode = req_str(&args, "mode")?;
+            let d = crate::commands::rule_cmd::mode_set_inner(&state, mode).await?;
             to_val(serde_json::to_value(d).map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?)
         }
 

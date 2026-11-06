@@ -6,7 +6,10 @@ using Microsoft.UI.Xaml.Media;
 namespace ClashZhengl.Pages;
 
 /// <summary>
-/// 订阅页：列表 + 添加/更新/删除/应用配置。
+/// 订阅页：列表 + 添加/编辑/更新/删除/应用配置。
+///
+/// 0.1.1 增强：卡片展示月度流量进度条、到期警示、用户名、机场地址、备注；
+/// 「编辑」对话框可改全部管理信息；添加时可展开「更多信息」。
 /// </summary>
 public sealed class SubscriptionsPage
 {
@@ -23,8 +26,6 @@ public sealed class SubscriptionsPage
             var subs = await App.Daemon.CallAsync<List<Subscription>>("subscription_list");
 
             _host.Children.Clear();
-
-            // 顶部标题 + 操作按钮
             _host.Children.Add(BuildHeader(subs));
 
             if (subs.Count == 0)
@@ -44,6 +45,10 @@ public sealed class SubscriptionsPage
             ShowError(_host, e.FriendlyMessage);
         }
     }
+
+    // ========================================================================
+    //  头部
+    // ========================================================================
 
     private UIElement BuildHeader(List<Subscription> subs)
     {
@@ -85,6 +90,7 @@ public sealed class SubscriptionsPage
         btnRefresh.Click += async (_, _) =>
         {
             btnRefresh.IsEnabled = false;
+            btnRefresh.Content = "更新中…";
             try
             {
                 await App.Daemon.CallAsync("subscription_fetch_all", timeoutSec: 120);
@@ -93,10 +99,12 @@ public sealed class SubscriptionsPage
             catch (DaemonException e)
             {
                 Log.Error($"更新全部订阅失败：{e.FriendlyMessage}");
+                await ShowInfoAsync(e.FriendlyMessage);
             }
             finally
             {
                 btnRefresh.IsEnabled = true;
+                btnRefresh.Content = "全部更新";
             }
         };
         btns.Children.Add(btnRefresh);
@@ -148,6 +156,10 @@ public sealed class SubscriptionsPage
         return card;
     }
 
+    // ========================================================================
+    //  卡片
+    // ========================================================================
+
     private UIElement BuildCard(Subscription s)
     {
         var card = new Border
@@ -155,17 +167,45 @@ public sealed class SubscriptionsPage
             Style = (Style)Application.Current.Resources["CardStyle"],
         };
 
-        var root = new Grid();
-        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var root = new StackPanel { Spacing = 0 };
 
-        // ---- 第一行：名称 + 开关 ----
-        var row1 = new Grid();
-        row1.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row1.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        root.Children.Add(BuildCardHeader(s));
 
-        var nameSp = new StackPanel { Spacing = 3 };
+        // 月度流量进度条（有总量数据才显示）
+        if (s.Traffic is { } t && (t.HasTotal || t.Unlimited))
+        {
+            root.Children.Add(BuildTrafficBar(t));
+        }
+
+        root.Children.Add(BuildCardStats(s));
+
+        // 备注
+        if (s.Remark is { Length: > 0 } remark)
+        {
+            root.Children.Add(new TextBlock
+            {
+                Text = remark,
+                FontSize = 12,
+                Margin = new Thickness(0, 10, 0, 0),
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = (Brush)Application.Current.Resources["TextSecondaryBrush"],
+            });
+        }
+
+        root.Children.Add(BuildCardActions(s));
+
+        card.Child = root;
+        return card;
+    }
+
+    private UIElement BuildCardHeader(Subscription s)
+    {
+        var row = new Grid();
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var left = new StackPanel { Spacing = 3 };
+
         var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         nameRow.Children.Add(new TextBlock
         {
@@ -175,32 +215,48 @@ public sealed class SubscriptionsPage
             Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
         });
 
+        if (s.Username is { Length: > 0 } un)
+        {
+            nameRow.Children.Add(Badge($"@{un}", "NavBgBrush", "TextSecondaryBrush"));
+        }
+
         if (s.LastError is { Length: > 0 })
         {
-            nameRow.Children.Add(new Border
-            {
-                Background = (Brush)Application.Current.Resources["BadBrush"],
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(6, 1, 6, 1),
-                Child = new TextBlock
-                {
-                    Text = "更新失败",
-                    FontSize = 10.5,
-                    Foreground = new SolidColorBrush(Microsoft.UI.Colors.White),
-                },
-            });
+            nameRow.Children.Add(Badge("更新失败", "BadBrush", null, white: true));
         }
-        nameSp.Children.Add(nameRow);
-
-        nameSp.Children.Add(new TextBlock
+        else if (s.Traffic is { Stale: true })
         {
-            Text = s.UrlMasked,
+            nameRow.Children.Add(Badge("流量数据过期", "SlowBrush", null, white: true));
+        }
+
+        left.Children.Add(nameRow);
+
+        // 地址行：脱敏地址 + 机场地址链接
+        var addrRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+
+        addrRow.Children.Add(new TextBlock
+        {
+            Text = s.UrlHint,
             FontSize = 11.5,
             Foreground = (Brush)Application.Current.Resources["TextTertiaryBrush"],
             TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxWidth = 380,
         });
 
-        row1.Children.Add(nameSp);
+        if (s.Homepage is { Length: > 0 } home)
+        {
+            var link = new HyperlinkButton
+            {
+                Content = "机场地址",
+                FontSize = 11.5,
+                Padding = new Thickness(0),
+                NavigateUri = TryUri(home),
+            };
+            addrRow.Children.Add(link);
+        }
+
+        left.Children.Add(addrRow);
+        row.Children.Add(left);
 
         var toggle = new ToggleSwitch
         {
@@ -222,11 +278,99 @@ public sealed class SubscriptionsPage
             }
         };
         Grid.SetColumn(toggle, 1);
-        row1.Children.Add(toggle);
+        row.Children.Add(toggle);
 
-        root.Children.Add(row1);
+        return row;
+    }
 
-        // ---- 第二行：统计信息 ----
+    /// <summary>月度流量进度条：已用 / 总量 + 百分比 + 到期信息。</summary>
+    private UIElement BuildTrafficBar(SubscriptionTraffic t)
+    {
+        var wrap = new StackPanel { Spacing = 6, Margin = new Thickness(0, 12, 0, 0) };
+
+        var used = t.Used ?? ((t.Upload ?? 0) + (t.Download ?? 0));
+        var pct = t.UsedPercent ?? (t.HasTotal ? used * 100.0 / t.Total!.Value : 0);
+
+        // 文案行
+        var textRow = new Grid();
+        textRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        textRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var usedText = t.Unlimited
+            ? $"已用 {MainWindow.FormatBytes(used)} · 不限量"
+            : $"已用 {MainWindow.FormatBytes(used)} / {MainWindow.FormatBytes(t.Total!.Value)}";
+
+        textRow.Children.Add(new TextBlock
+        {
+            Text = usedText,
+            FontSize = 12,
+            Foreground = (Brush)Application.Current.Resources["TextSecondaryBrush"],
+        });
+
+        var right = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+        };
+
+        if (!t.Unlimited)
+        {
+            right.Children.Add(new TextBlock
+            {
+                Text = $"{pct:0.#}%",
+                FontSize = 12,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = TrafficBrush(pct),
+            });
+        }
+
+        if (t.DaysLeft is long dl)
+        {
+            right.Children.Add(new TextBlock
+            {
+                Text = dl <= 0 ? "已到期" : $"剩余 {dl} 天",
+                FontSize = 12,
+                FontWeight = dl <= 7
+                    ? Microsoft.UI.Text.FontWeights.SemiBold
+                    : Microsoft.UI.Text.FontWeights.Normal,
+                Foreground = ExpireBrush(dl),
+            });
+        }
+        else if (t.ExpireAt is long ea)
+        {
+            var dt = DateTimeOffset.FromUnixTimeSeconds(ea).LocalDateTime;
+            right.Children.Add(new TextBlock
+            {
+                Text = dt.ToString("yyyy-MM-dd 到期"),
+                FontSize = 12,
+                Foreground = (Brush)Application.Current.Resources["TextSecondaryBrush"],
+            });
+        }
+
+        Grid.SetColumn(right, 1);
+        textRow.Children.Add(right);
+        wrap.Children.Add(textRow);
+
+        // 进度条
+        if (!t.Unlimited)
+        {
+            var bar = new ProgressBar
+            {
+                Minimum = 0,
+                Maximum = 100,
+                Value = Math.Clamp(pct, 0, 100),
+                Height = 4,
+                Background = (Brush)Application.Current.Resources["DividerBrush"],
+                Foreground = TrafficBrush(pct),
+            };
+            wrap.Children.Add(bar);
+        }
+
+        return wrap;
+    }
+
+    private UIElement BuildCardStats(Subscription s)
+    {
         var stats = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -234,28 +378,27 @@ public sealed class SubscriptionsPage
             Margin = new Thickness(0, 12, 0, 0),
         };
 
-        stats.Children.Add(StatItem("节点", s.NodeCount is int n ? $"{n} 个" : "—"));
+        stats.Children.Add(StatItem("节点", $"{s.NodeCount} 个"));
         stats.Children.Add(StatItem("间隔",
-            s.IntervalMin >= 60 ? $"{s.IntervalMin / 60} 小时" : $"{s.IntervalMin} 分钟"));
+            s.UpdateIntervalMin >= 60
+                ? $"{s.UpdateIntervalMin / 60} 小时"
+                : $"{s.UpdateIntervalMin} 分钟"));
 
-        if (s.LastFetchAt is long lf)
+        if (s.LastUpdateAt is long lf)
         {
             var dt = DateTimeOffset.FromUnixTimeSeconds(lf).ToLocalTime();
             stats.Children.Add(StatItem("上次更新", dt.ToString("MM-dd HH:mm")));
         }
-
-        if (s.Userinfo is { Total: > 0 } ui)
+        else
         {
-            var used = (ui.Upload ?? 0) + (ui.Download ?? 0);
-            var pct = ui.Total is > 0 ? used * 100.0 / ui.Total.Value : 0;
-            stats.Children.Add(StatItem("已用流量",
-                $"{MainWindow.FormatBytes(used)} / {MainWindow.FormatBytes(ui.Total.Value)} ({pct:0}%)"));
+            stats.Children.Add(StatItem("上次更新", "从未"));
         }
 
-        Grid.SetRow(stats, 1);
-        root.Children.Add(stats);
+        return stats;
+    }
 
-        // ---- 第三行：操作 ----
+    private UIElement BuildCardActions(Subscription s)
+    {
         var actions = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -288,19 +431,37 @@ public sealed class SubscriptionsPage
         };
         actions.Children.Add(btnUpdate);
 
-        var btnRename = new Button { Content = "重命名", FontSize = 12.5 };
-        btnRename.Click += async (_, _) => await ShowRenameDialogAsync(s);
-        actions.Children.Add(btnRename);
+        var btnEdit = new Button { Content = "编辑", FontSize = 12.5 };
+        btnEdit.Click += async (_, _) => await ShowEditDialogAsync(s);
+        actions.Children.Add(btnEdit);
 
         var btnDelete = new Button { Content = "删除", FontSize = 12.5 };
         btnDelete.Click += async (_, _) => await ConfirmDeleteAsync(s);
         actions.Children.Add(btnDelete);
 
-        Grid.SetRow(actions, 2);
-        root.Children.Add(actions);
+        return actions;
+    }
 
-        card.Child = root;
-        return card;
+    // ========================================================================
+    //  小组件
+    // ========================================================================
+
+    private static Border Badge(string text, string bgKey, string? fgKey, bool white = false)
+    {
+        return new Border
+        {
+            Background = (Brush)Application.Current.Resources[bgKey],
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(6, 1, 6, 1),
+            Child = new TextBlock
+            {
+                Text = text,
+                FontSize = 10.5,
+                Foreground = white
+                    ? new SolidColorBrush(Microsoft.UI.Colors.White)
+                    : (Brush)Application.Current.Resources[fgKey ?? "TextSecondaryBrush"],
+            },
+        };
     }
 
     private static UIElement StatItem(string label, string value)
@@ -321,16 +482,68 @@ public sealed class SubscriptionsPage
         return sp;
     }
 
+    /// <summary>用量越低越绿，超过 80% 转橙，超过 95% 转红。</summary>
+    private static Brush TrafficBrush(double pct) => (Brush)Application.Current.Resources[
+        pct >= 95 ? "BadBrush" : pct >= 80 ? "SlowBrush" : "BrandBrush"];
+
+    /// <summary>到期提醒：≤3 天红色，≤7 天橙色，其余次要色。</summary>
+    private static Brush ExpireBrush(long daysLeft) => (Brush)Application.Current.Resources[
+        daysLeft <= 3 ? "BadBrush" : daysLeft <= 7 ? "SlowBrush" : "TextSecondaryBrush"];
+
+    private static Uri? TryUri(string s)
+    {
+        if (Uri.TryCreate(s, UriKind.Absolute, out var u) &&
+            (u.Scheme == Uri.UriSchemeHttp || u.Scheme == Uri.UriSchemeHttps))
+        {
+            return u;
+        }
+        return null;
+    }
+
     // ========================================================================
     //  对话框
     // ========================================================================
 
+    /// <summary>添加对话框，含可展开的「更多信息」（用户名/密码/机场地址/备注）。</summary>
     private async Task ShowAddDialogAsync()
     {
         var nameBox = new TextBox { PlaceholderText = "订阅名称（可留空自动生成）" };
         var urlBox = new TextBox { PlaceholderText = "https://example.com/sub?token=..." };
 
-        var panel = new StackPanel { Spacing = 12, Width = 420 };
+        var userBox = new TextBox { PlaceholderText = "机场登录用户名（可选）" };
+        var passBox = new PasswordBox { PlaceholderText = "机场登录密码（可选，仅本地加密保存）" };
+        var homeBox = new TextBox { PlaceholderText = "https://example.com（可选）" };
+        var remarkBox = new TextBox
+        {
+            PlaceholderText = "备注（可选）",
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            Height = 60,
+        };
+
+        var morePanel = new StackPanel { Spacing = 10, Visibility = Visibility.Collapsed };
+        morePanel.Children.Add(SectionLabel("机场登录信息"));
+        morePanel.Children.Add(userBox);
+        morePanel.Children.Add(passBox);
+        morePanel.Children.Add(homeBox);
+        morePanel.Children.Add(SectionLabel("备注"));
+        morePanel.Children.Add(remarkBox);
+
+        var moreToggle = new HyperlinkButton
+        {
+            Content = "更多信息（可选）▾",
+            FontSize = 12,
+            Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        moreToggle.Click += (_, _) =>
+        {
+            var show = morePanel.Visibility == Visibility.Collapsed;
+            morePanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            moreToggle.Content = show ? "收起 ▴" : "更多信息（可选）▾";
+        };
+
+        var panel = new StackPanel { Spacing = 12, Width = 440 };
         panel.Children.Add(new TextBlock
         {
             Text = "订阅链接通常以 http(s) 开头，包含你的个人 token，请勿分享给他人。",
@@ -338,12 +551,14 @@ public sealed class SubscriptionsPage
         });
         panel.Children.Add(nameBox);
         panel.Children.Add(urlBox);
+        panel.Children.Add(moreToggle);
+        panel.Children.Add(morePanel);
 
         var dlg = new ContentDialog
         {
             XamlRoot = _host.XamlRoot,
             Title = "添加订阅",
-            Content = panel,
+            Content = new ScrollViewer { Content = panel, MaxHeight = 380 },
             PrimaryButtonText = "添加",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
@@ -361,10 +576,41 @@ public sealed class SubscriptionsPage
         var name = nameBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(name)) name = "订阅";
 
+        // 有附加信息就走 add_ex；后端没实现时自动回退到 subscription_add
+        var hasExtra = userBox.Text.Trim().Length > 0
+                       || passBox.Password.Length > 0
+                       || homeBox.Text.Trim().Length > 0
+                       || remarkBox.Text.Trim().Length > 0;
+
         try
         {
-            await App.Daemon.CallAsync<Subscription>("subscription_add",
-                new { name, url }, timeoutSec: 60);
+            if (hasExtra)
+            {
+                try
+                {
+                    await App.Daemon.CallAsync<Subscription>("subscription_add_ex", new
+                    {
+                        name,
+                        url,
+                        username = NullIfEmpty(userBox.Text),
+                        password = NullIfEmpty(passBox.Password),
+                        homepage = NullIfEmpty(homeBox.Text),
+                        remark = NullIfEmpty(remarkBox.Text),
+                    }, timeoutSec: 60);
+                }
+                catch (DaemonException ex) when (ex.IsUnknownCommand)
+                {
+                    // 后端还没实现扩展命令：先按基础方式添加，再提示补填
+                    await App.Daemon.CallAsync<Subscription>("subscription_add",
+                        new { name, url }, timeoutSec: 60);
+                    await ShowInfoAsync("当前内核服务尚不支持附加信息，已先添加订阅。请稍后在「编辑」里补填。");
+                }
+            }
+            else
+            {
+                await App.Daemon.CallAsync<Subscription>("subscription_add",
+                    new { name, url }, timeoutSec: 60);
+            }
             await RefreshAsync();
         }
         catch (DaemonException e)
@@ -374,15 +620,73 @@ public sealed class SubscriptionsPage
         }
     }
 
-    private async Task ShowRenameDialogAsync(Subscription s)
+    /// <summary>编辑对话框：改名称/启用/间隔 + 全部管理信息。</summary>
+    private async Task ShowEditDialogAsync(Subscription s)
     {
-        var box = new TextBox { Text = s.Name };
+        var nameBox = new TextBox { Text = s.Name, Header = "名称" };
+
+        var enabledToggle = new ToggleSwitch
+        {
+            IsOn = s.Enabled,
+            Header = "启用",
+            OnContent = "启用",
+            OffContent = "停用",
+        };
+
+        var intervalBox = new NumberBox
+        {
+            Value = s.UpdateIntervalMin,
+            Minimum = 0,
+            Maximum = 10080,
+            SmallChange = 60,
+            LargeChange = 360,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            Header = "自动更新间隔（分钟，0 表示不自动更新）",
+        };
+
+        var userBox = new TextBox { Text = s.Username ?? "", Header = "机场登录用户名" };
+        var passBox = new PasswordBox
+        {
+            PlaceholderText = s.HasPassword ? "已设置，留空则不修改" : "未设置",
+            Header = "机场登录密码",
+        };
+        var homeBox = new TextBox { Text = s.Homepage ?? "", Header = "机场地址" };
+        var remarkBox = new TextBox
+        {
+            Text = s.Remark ?? "",
+            Header = "备注",
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            Height = 64,
+        };
+
+        var panel = new StackPanel { Spacing = 12, Width = 440 };
+        panel.Children.Add(nameBox);
+        panel.Children.Add(enabledToggle);
+        panel.Children.Add(intervalBox);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "机场登录信息",
+            Style = (Style)Application.Current.Resources["SectionTitleStyle"],
+            Margin = new Thickness(0, 6, 0, 0),
+        });
+        panel.Children.Add(userBox);
+        panel.Children.Add(passBox);
+        panel.Children.Add(homeBox);
+        panel.Children.Add(remarkBox);
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"地址：{s.UrlHint}（订阅链接不可修改，如需更换请删除后重新添加）",
+            Style = (Style)Application.Current.Resources["HintTextStyle"],
+        });
 
         var dlg = new ContentDialog
         {
             XamlRoot = _host.XamlRoot,
-            Title = "重命名订阅",
-            Content = box,
+            Title = "编辑订阅",
+            // 窗口默认 660 高，ContentDialog 还要留出标题栏与按钮区，
+            // 内容区超过 380 就会把对话框顶出屏幕外（标题和「名称」看不见）。
+            Content = new ScrollViewer { Content = panel, MaxHeight = 380 },
             PrimaryButtonText = "保存",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
@@ -390,17 +694,52 @@ public sealed class SubscriptionsPage
 
         if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
 
-        var name = box.Text.Trim();
-        if (string.IsNullOrWhiteSpace(name)) return;
+        var name = nameBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(name)) name = s.Name;
+
+        var interval = (int)Math.Round(double.IsNaN(intervalBox.Value) ? s.UpdateIntervalMin : intervalBox.Value);
 
         try
         {
-            await App.Daemon.CallAsync("subscription_update",
-                new { uid = s.Uid, name });
+            // 1. 基础字段：name / enabled / intervalMin（这一步后端一直支持）
+            await App.Daemon.CallAsync("subscription_update", new
+            {
+                uid = s.Uid,
+                name,
+                enabled = enabledToggle.IsOn,
+                intervalMin = interval,
+            });
+
+            // 2. 管理信息：走 subscription_update_meta，未实现则提示
+            var metaChanged = (userBox.Text.Trim() != (s.Username ?? ""))
+                              || passBox.Password.Length > 0
+                              || (homeBox.Text.Trim() != (s.Homepage ?? ""))
+                              || (remarkBox.Text.Trim() != (s.Remark ?? ""));
+
+            if (metaChanged)
+            {
+                try
+                {
+                    await App.Daemon.CallAsync("subscription_update_meta", new
+                    {
+                        uid = s.Uid,
+                        username = NullIfEmpty(userBox.Text),
+                        password = NullIfEmpty(passBox.Password),
+                        homepage = NullIfEmpty(homeBox.Text),
+                        remark = NullIfEmpty(remarkBox.Text),
+                    });
+                }
+                catch (DaemonException ex) when (ex.IsUnknownCommand)
+                {
+                    await ShowInfoAsync("当前内核服务尚不支持保存机场登录信息，名称与启用状态已保存。");
+                }
+            }
+
             await RefreshAsync();
         }
         catch (DaemonException e)
         {
+            Log.Error($"编辑订阅失败 code={e.Code}", e);
             await ShowInfoAsync(e.FriendlyMessage);
         }
     }
@@ -432,6 +771,7 @@ public sealed class SubscriptionsPage
 
     private async Task ShowInfoAsync(string msg)
     {
+        if (_host.XamlRoot is null) return;
         var dlg = new ContentDialog
         {
             XamlRoot = _host.XamlRoot,
@@ -440,6 +780,18 @@ public sealed class SubscriptionsPage
             CloseButtonText = "知道了",
         };
         try { await dlg.ShowAsync(); } catch { }
+    }
+
+    private static TextBlock SectionLabel(string text) => new()
+    {
+        Text = text,
+        Style = (Style)Application.Current.Resources["SectionTitleStyle"],
+    };
+
+    private static string? NullIfEmpty(string? s)
+    {
+        var v = s?.Trim();
+        return string.IsNullOrWhiteSpace(v) ? null : v;
     }
 
     private static void ShowError(StackPanel host, string msg)

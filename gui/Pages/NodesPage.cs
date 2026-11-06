@@ -63,6 +63,14 @@ public sealed class NodesPage
 
             Render();
         }
+        catch (DaemonException e) when (e.Code == "E_CORE_NOT_RUNNING")
+        {
+            // 内核没起来不是错误：启动时序上必然先连上 daemon、内核稍后才好。
+            // 降级成普通提示，等 core:state 事件或下一次刷新自然恢复。
+            _groups.Clear();
+            _coreRunning = false;
+            Render();
+        }
         catch (DaemonException e)
         {
             Log.Error($"加载节点失败 code={e.Code}", e);
@@ -307,8 +315,12 @@ public sealed class NodesPage
             Height = 16,
             CornerRadius = new CornerRadius(2),
             VerticalAlignment = VerticalAlignment.Center,
-            Background = (Brush)Application.Current.Resources[
-                n.Selected ? "BrandBrush" : "Transparent"],
+            // "Transparent" 不是主题资源键，Application.Current.Resources["Transparent"]
+            // 会抛 KeyNotFound（.NET 里报成「未指定的错误」），整页渲染中断。
+            // 未选中的标记条必须用真正透明的画刷。
+            Background = n.Selected
+                ? (Brush)Application.Current.Resources["BrandBrush"]
+                : new SolidColorBrush(Microsoft.UI.Colors.Transparent),
         });
 
         left.Children.Add(new TextBlock

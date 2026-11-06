@@ -32,7 +32,7 @@
     <AssemblyName>ClashZhengl</AssemblyName>
     <AssemblyTitle>Clash Zhengl</AssemblyTitle>
     <Product>Clash Zhengl</Product>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Company>myxiaolizi</Company>
     <Copyright>MIT License</Copyright>
   </PropertyGroup>

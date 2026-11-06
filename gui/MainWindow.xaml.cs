@@ -14,15 +14,18 @@ namespace ClashZhengl;
 
 public sealed partial class MainWindow : Window
 {
+    private readonly Pages.HomePage _pageHome;
     private readonly Pages.SubscriptionsPage _pageSubs;
     private readonly Pages.TrafficPage _pageTraffic;
     private readonly Pages.NodesPage _pageNodes;
+    private readonly Pages.RulesPage _pageRules;
     private readonly Pages.SettingsPage _pageSettings;
 
     private readonly DispatcherTimer _statusTimer;
+    private readonly DispatcherTimer _homeTimer;
     private bool _allowClose;
     private bool _bootDone;
-    private string _currentPage = "subscriptions";
+    private string _currentPage = "home";
 
     public MainWindow()
     {
@@ -35,9 +38,11 @@ public sealed partial class MainWindow : Window
         ApplyBackdrop();
         ConfigureWindowSize();
 
+        _pageHome = new Pages.HomePage(HomeHost);
         _pageSubs = new Pages.SubscriptionsPage(SubscriptionsHost);
         _pageTraffic = new Pages.TrafficPage(TrafficHost);
         _pageNodes = new Pages.NodesPage(NodesHost);
+        _pageRules = new Pages.RulesPage(RulesHost);
         _pageSettings = new Pages.SettingsPage(SettingsHost);
 
         // 窗口关闭：默认最小化到托盘，只有"真退出"才真关
@@ -47,6 +52,13 @@ public sealed partial class MainWindow : Window
         _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         _statusTimer.Tick += async (_, _) => await RefreshStatusAsync();
         _statusTimer.Start();
+
+        // 首页数据兜底刷新。事件覆盖不到的状态变化（内核自动重启、
+        // 系统代理被别的程序改动）靠这个保证不长期停在旧值。
+        // 5 秒一次：首页要显示实时速率，太慢会显得卡顿，太快又白耗 CPU。
+        _homeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _homeTimer.Tick += async (_, _) => await _pageHome.TickAsync();
+        _homeTimer.Start();
 
         // 主题跟随系统
         if (Content is FrameworkElement fe)
@@ -120,38 +132,27 @@ public sealed partial class MainWindow : Window
                 if (s.Width > 300 && s.Height > 300)
                     WindowStateStore.SaveSize(s.Width, s.Height);
             }
+
+            // 窗口按钮改由系统提供后，最大/还原不再经过我们的 Click 回调，
+            // 只能在这里记录最大化状态。
+            if (e.DidPresenterChange && appWindow.Presenter is OverlappedPresenter op)
+            {
+                WindowStateStore.SaveMaximized(op.State == OverlappedPresenterState.Maximized);
+            }
         };
     }
-
-    // ========================================================================
-    //  标题栏按钮
-    // ========================================================================
-
-    private void OnMinimizeClick(object sender, RoutedEventArgs e)
-    {
-        if (AppWindow.Presenter is OverlappedPresenter p)
-            p.Minimize();
-    }
-
-    private void OnMaximizeClick(object sender, RoutedEventArgs e)
-    {
-        if (AppWindow.Presenter is OverlappedPresenter p)
-        {
-            if (p.State == OverlappedPresenterState.Maximized)
-                p.Restore();
-            else
-                p.Maximize();
-            WindowStateStore.SaveMaximized(p.State == OverlappedPresenterState.Maximized);
-        }
-    }
-
-    private void OnCloseClick(object sender, RoutedEventArgs e)
-        => Close(); // 走 OnAppWindowClosing，由设置决定最小化还是退出
 
     // ========================================================================
     //  关闭语义
     // ========================================================================
 
+    /// <summary>
+    /// 关闭时「最小化到托盘」还是「真正退出」。
+    ///
+    /// 关键点：点 × 只隐藏窗口，**绝不**取消/停止 daemon。
+    /// 只有托盘菜单的「退出」会调 <see cref="AllowClose"/> 再 Close()，
+    /// 这时才允许 App 做退出清理并把 daemon 一起停掉。
+    /// </summary>
     private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
         if (_allowClose) return;
@@ -159,16 +160,20 @@ public sealed partial class MainWindow : Window
         var closeToTray = _pageSettings?.Settings?.CloseToTray ?? true;
         if (closeToTray)
         {
-            // 取消关闭，改为隐藏 —— 托盘图标仍在，用户可再唤出
+            // 取消真实关闭，只藏窗口：托盘图标和内核服务都继续活着
             args.Cancel = true;
             HideToTray();
             _pageSettings?.PersistCurrentSize();
         }
         else
         {
+            // 用户明确选择了「关闭即退出」，放行这次关闭
             _allowClose = true;
         }
     }
+
+    /// <summary>是否已被显式放行关闭（供 App 判断要不要做退出清理）。</summary>
+    public bool CloseAllowed => _allowClose;
 
     private void HideToTray()
     {
@@ -197,6 +202,7 @@ public sealed partial class MainWindow : Window
     {
         _allowClose = true;
         _statusTimer.Stop();
+        _homeTimer.Stop();
     }
 
     // ========================================================================
@@ -247,9 +253,11 @@ public sealed partial class MainWindow : Window
             ApplyTheme(settings.Theme);
 
             await _pageSettings.InitializeAsync(settings).ConfigureAwait(true);
+            await _pageHome.InitializeAsync().ConfigureAwait(true);
             await _pageSubs.InitializeAsync().ConfigureAwait(true);
             await _pageTraffic.InitializeAsync().ConfigureAwait(true);
             await _pageNodes.InitializeAsync().ConfigureAwait(true);
+            await _pageRules.InitializeAsync().ConfigureAwait(true);
             await RefreshStatusAsync().ConfigureAwait(true);
 
             _bootDone = true;
@@ -306,22 +314,29 @@ public sealed partial class MainWindow : Window
     private void OnNavSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (NavList.SelectedItem is not ListViewItem item) return;
-        var tag = item.Tag as string ?? "subscriptions";
+        var tag = item.Tag as string ?? "home";
         if (tag == _currentPage) return;
 
         _currentPage = tag;
 
+        PageHome.Visibility = tag == "home" ? Visibility.Visible : Visibility.Collapsed;
         PageSubscriptions.Visibility = tag == "subscriptions" ? Visibility.Visible : Visibility.Collapsed;
         PageTraffic.Visibility = tag == "traffic" ? Visibility.Visible : Visibility.Collapsed;
         PageNodes.Visibility = tag == "nodes" ? Visibility.Visible : Visibility.Collapsed;
+        PageRules.Visibility = tag == "rules" ? Visibility.Visible : Visibility.Collapsed;
         PageSettings.Visibility = tag == "settings" ? Visibility.Visible : Visibility.Collapsed;
+
+        // 只有首页在前台时才跑定时刷新，后台页不空转
+        _pageHome.SetActive(tag == "home");
 
         _ = tag switch
         {
+            "home" => _pageHome.RefreshAsync(),
+            "subscriptions" => _pageSubs.RefreshAsync(),
             "traffic" => _pageTraffic.RefreshAsync(),
             "nodes" => _pageNodes.RefreshAsync(),
+            "rules" => _pageRules.RefreshAsync(),
             "settings" => _pageSettings.RefreshAsync(),
-            "subscriptions" => _pageSubs.RefreshAsync(),
             _ => Task.CompletedTask,
         };
     }
@@ -391,6 +406,14 @@ public sealed partial class MainWindow : Window
     //  事件分发
     // ========================================================================
 
+    /// <summary>
+    /// daemon 事件分发。
+    ///
+    /// 事件名必须逐字对齐 Rust 侧实际 emit 的字符串——
+    /// 0.1.0 监听的是 <c>sysproxy:state</c>，而 Rust 实际发的是
+    /// <c>sysproxy:changed</c>，所以系统代理状态一直不跟随。
+    /// 这里两种名字都接住，后端改名也不至于失效。
+    /// </summary>
     public void HandleDaemonEvent(string name, JsonElement data)
     {
         try
@@ -398,26 +421,80 @@ public sealed partial class MainWindow : Window
             switch (name)
             {
                 case "core:state":
+                    _pageHome.OnCoreEvent(data);
+                    _pageNodes.HandleEvent(name, data);
                     _ = RefreshStatusAsync();
                     break;
+
+                case "core:installed":
+                case "core:installFailed":
+                case "core:downloadProgress":
                 case "core:install-progress":
+                    _pageNodes.HandleEvent(name, data);
+                    _pageSettings.OnCoreEvent(name, data);
+                    break;
+
+                case "speedtest:started":
+                case "speedtest:done":
                 case "speedtest:progress":
                     _pageNodes.HandleEvent(name, data);
                     break;
-                case "subscription:updated":
+
                 case "subscription:added":
+                case "subscription:updated":
                 case "subscription:removed":
+                case "subscription:fetched":
+                case "subscription:fetchedAll":
+                case "subscription:applied":
                     _ = _pageSubs.RefreshAsync();
+                    _ = _pageHome.RefreshAsync();
                     break;
+
+                // 兼容两种命名：Rust 实际发的是 sysproxy:changed
+                case "sysproxy:changed":
                 case "sysproxy:state":
+                    _pageHome.OnSysProxyEvent(data);
                     _ = RefreshStatusAsync();
                     break;
+
+                case "settings:changed":
+                    _pageHome.OnSettingsEvent(data);
+                    break;
+
                 case "switch:applied":
+                case "switch:manual":
                     _pageNodes.OnSwitchApplied(data);
                     break;
+
                 case "traffic:updated":
+                    _pageHome.OnTrafficEvent(data);
                     _pageTraffic.OnTrafficEvent(data);
                     break;
+
+                // 规则变更后立刻重载内核，首页与规则页都要刷新
+                case "rule:applied":
+                    _ = _pageRules.RefreshAsync();
+                    _ = _pageHome.RefreshAsync();
+                    break;
+
+                // 分流模式被改了（可能来自托盘或别处），首页的选择器要跟上
+                case "mode:changed":
+                    _ = _pageHome.RefreshAsync();
+                    break;
+
+                // 流量统计被重置（如「重置今日」），刷新趋势图
+                case "traffic:reset":
+                    _ = _pageHome.RefreshAsync();
+                    _ = _pageTraffic.RefreshAsync();
+                    break;
+
+                // daemon 自己要退出了：这里的意图是「整个程序退出」，
+                // 不该触发自动重连把它再拉起来。让 GUI 跟着退出。
+                case "daemon:shutdown":
+                    Log.Info("daemon 通知退出，程序随之关闭");
+                    App.QuitNow();
+                    break;
+
                 default:
                     Log.Info($"未处理事件: {name}");
                     break;

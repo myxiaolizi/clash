@@ -153,10 +153,14 @@ pub enum Suppress {
     WithinTolerance,
     /// ⑤ 当前已是最优
     AlreadyBest,
+    /// ⑥ 当前节点失败但仍在重试窗口内（on_failure_action = retry）
+    Retrying,
+    /// ⑦ 失败转移被关闭（failover_enabled=false 或 action=none）
+    FailoverDisabled,
 }
 
 impl Suppress {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Suppress::ManualOverride => "manual_override",
             Suppress::Disabled => "disabled",
@@ -164,6 +168,8 @@ impl Suppress {
             Suppress::NoCandidate => "no_candidate",
             Suppress::WithinTolerance => "within_tolerance",
             Suppress::AlreadyBest => "already_best",
+            Suppress::Retrying => "retrying",
+            Suppress::FailoverDisabled => "failover_disabled",
         }
     }
 }
@@ -202,7 +208,18 @@ pub struct DecisionCtx<'a> {
     pub now: i64,
 }
 
-/// 核心决策函数（07 §7.4）
+/// 核心决策函数（07 §7.4 + v3 失败转移）
+///
+/// 判定顺序（⓪ 优先级最高）：
+/// ⓪ 手动覆盖期内 → 抑制
+/// ① 启用开关关闭 → 抑制
+/// ② 当前节点失败达阈值 → 按 `on_failure_action` 处置：
+///    - `switch`：立刻切到最优候选（**不受 min_dwell 约束**，救急优先）
+///    - `retry`：仍在重试窗口内 → 抑制；超过 `max_retries` → 切
+///    - `none`   ：抑制，只留痕
+/// ③ 最短驻留未满 → 抑制
+/// ④ 存在明显更快的候选 → 切换（reason = Best）
+/// 否则不切换
 pub fn decide(ctx: &DecisionCtx<'_>) -> Decision {
     // ⓪ 手动覆盖期：最高优先级，用户刚选过就不许系统覆盖
     if let Some(until) = ctx.manual_lock_until {
@@ -216,28 +233,24 @@ pub fn decide(ctx: &DecisionCtx<'_>) -> Decision {
         return Decision::Hold(Suppress::Disabled);
     }
 
-    // ③ 当前节点失败达阈值 → 优先救急，**不受 min_dwell 约束**
-    //    理由：节点挂了还硬等 5 分钟，用户会认为软件坏了
+    // ② 当前节点失败达阈值
+    //
+    //    「失败」的判定必须同时看两个信号：
+    //    - 本轮探测无延迟（cur_failed）
+    //    - 连续失败次数已达阈值
+    //    只看次数不够：一次探测失败后立刻达阈值（threshold=1）时也要能救急。
     let cur_failed = ctx.current_delay.is_none();
     if cur_failed && ctx.current_failures >= ctx.policy.failure_threshold {
-        if let Some(best) = ctx.candidates.first() {
-            // 候选不能是当前节点自身
-            if Some(best.node_key.as_str()) != ctx.current {
-                return Decision::Switch {
-                    to_node: best.node_key.clone(),
-                    to_delay: Some(best.delay_ms),
-                    from_delay: None,
-                    reason: SwitchReason::CurrentFailed,
-                };
-            }
-        }
-        return Decision::Hold(Suppress::NoCandidate);
+        return handle_failure(ctx);
     }
 
-    // ② 最短驻留未满
+    // ③ 最短驻留未满
+    //
+    //    注意用 total_dwell_sec()（= min_dwell + dwell_after_switch）：
+    //    后者是"刚切过别马上切回来"的额外冷却，两者叠加生效。
     if let Some(last) = ctx.last_switch_at {
         let dwell = (ctx.now - last).max(0) as u32;
-        if dwell < ctx.policy.min_dwell_sec {
+        if dwell < ctx.policy.total_dwell_sec() {
             return Decision::Hold(Suppress::MinDwell);
         }
     }
@@ -273,6 +286,57 @@ pub fn decide(ctx: &DecisionCtx<'_>) -> Decision {
                 Decision::Hold(Suppress::WithinTolerance)
             }
         }
+    }
+}
+
+/// 当前节点失败达阈值后的处置。
+///
+/// 从 `decide()` 里拆出来是因为三种 action 的分支逻辑较独立，
+/// 混在主流程里会让最关键的"救急切换"路径难以看清。
+fn handle_failure(ctx: &DecisionCtx<'_>) -> Decision {
+    use crate::domain::model::OnFailureAction;
+
+    // 失败转移总开关关闭 → 什么都不做
+    if !ctx.policy.should_failover() {
+        return Decision::Hold(Suppress::FailoverDisabled);
+    }
+
+    // 没有候选可切：无论哪种 action 都只能原地待着
+    let best = ctx
+        .candidates
+        .iter()
+        .find(|c| Some(c.node_key.as_str()) != ctx.current);
+
+    match ctx.policy.on_failure_action {
+        OnFailureAction::Ignore => Decision::Hold(Suppress::FailoverDisabled),
+
+        OnFailureAction::Retry => {
+            // 还没到重试上限 → 保持当前节点，等下一轮再试
+            if (ctx.current_failures as u32) <= ctx.policy.max_retries {
+                Decision::Hold(Suppress::Retrying)
+            } else {
+                match best {
+                    Some(b) => Decision::Switch {
+                        to_node: b.node_key.clone(),
+                        to_delay: Some(b.delay_ms),
+                        from_delay: None,
+                        reason: SwitchReason::CurrentFailed,
+                    },
+                    None => Decision::Hold(Suppress::NoCandidate),
+                }
+            }
+        }
+
+        // 默认：立刻救急切换
+        OnFailureAction::Switch => match best {
+            Some(b) => Decision::Switch {
+                to_node: b.node_key.clone(),
+                to_delay: Some(b.delay_ms),
+                from_delay: None,
+                reason: SwitchReason::CurrentFailed,
+            },
+            None => Decision::Hold(Suppress::NoCandidate),
+        },
     }
 }
 
@@ -650,5 +714,145 @@ mod tests {
         };
         let rules = ExcludeRules::from_policy(&SwitchPolicy::default());
         assert_eq!(members_of(&g, &rules), vec!["a", "b"]);
+    }
+
+    // ---------- v3：失败转移 ----------
+
+    #[test]
+    fn failover_switch_action_rescues_immediately() {
+        let mut p = SwitchPolicy::default();
+        p.on_failure_action = crate::domain::model::OnFailureAction::Switch;
+        let g = grp();
+        let c = cands();
+        let mut cx = ctx(&p, &g, &c, Some("a"), None, 2, 1000);
+        cx.last_switch_at = Some(1000); // 刚切过也要救急
+        match decide(&cx) {
+            Decision::Switch { to_node, reason, .. } => {
+                assert_eq!(to_node, "b");
+                assert_eq!(reason, SwitchReason::CurrentFailed);
+            }
+            other => panic!("Switch action 应立刻切换，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failover_retry_action_holds_until_max_retries() {
+        let mut p = SwitchPolicy::default();
+        p.on_failure_action = crate::domain::model::OnFailureAction::Retry;
+        p.max_retries = 2;
+        let g = grp();
+        let c = cands();
+
+        // 失败 2 次，未超上限 → 继续重试
+        let d = decide(&ctx(&p, &g, &c, Some("a"), None, 2, 1000));
+        assert_eq!(d, Decision::Hold(Suppress::Retrying));
+
+        // 失败 3 次，超过上限 → 切换
+        match decide(&ctx(&p, &g, &c, Some("a"), None, 3, 1000)) {
+            Decision::Switch { to_node, .. } => assert_eq!(to_node, "b"),
+            other => panic!("超过重试上限应切换，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failover_none_action_never_switches() {
+        let mut p = SwitchPolicy::default();
+        p.on_failure_action = crate::domain::model::OnFailureAction::Ignore;
+        let g = grp();
+        let c = cands();
+        let d = decide(&ctx(&p, &g, &c, Some("a"), None, 9, 1000));
+        assert_eq!(d, Decision::Hold(Suppress::FailoverDisabled));
+    }
+
+    #[test]
+    fn failover_disabled_overrides_action() {
+        let mut p = SwitchPolicy::default();
+        p.failover_enabled = false;
+        p.on_failure_action = crate::domain::model::OnFailureAction::Switch;
+        let g = grp();
+        let c = cands();
+        let d = decide(&ctx(&p, &g, &c, Some("a"), None, 9, 1000));
+        assert_eq!(d, Decision::Hold(Suppress::FailoverDisabled));
+    }
+
+    #[test]
+    fn failover_switch_without_other_candidate_holds() {
+        let p = SwitchPolicy::default();
+        let g = grp();
+        // 只有当前节点一个候选
+        let c = vec![Candidate {
+            node_key: "a".into(),
+            delay_ms: 300,
+            region_rank: None,
+        }];
+        let d = decide(&ctx(&p, &g, &c, Some("a"), None, 5, 1000));
+        assert_eq!(d, Decision::Hold(Suppress::NoCandidate), "无候选只能原地等");
+    }
+
+    #[test]
+    fn dwell_after_switch_extends_cooldown() {
+        let mut p = SwitchPolicy::default(); // min_dwell = 300
+        p.dwell_after_switch_sec = 600; // 额外冷却 10 分钟
+        assert_eq!(p.total_dwell_sec(), 900);
+
+        let g = grp();
+        let c = cands();
+        let mut cx = ctx(&p, &g, &c, Some("a"), Some(300), 0, 1000);
+        // 距上次切换 500 秒：超过 min_dwell(300) 但未到 total_dwell(900)
+        cx.last_switch_at = Some(500);
+        assert_eq!(
+            decide(&cx),
+            Decision::Hold(Suppress::MinDwell),
+            "额外冷却期内不得切换"
+        );
+    }
+
+    #[test]
+    fn total_dwell_capped_at_one_day() {
+        let mut p = SwitchPolicy::default();
+        p.min_dwell_sec = 86_400;
+        p.dwell_after_switch_sec = 86_400;
+        assert_eq!(p.total_dwell_sec(), 86_400, "不得超过一天");
+    }
+
+    #[test]
+    fn should_failover_matrix() {
+        let mut p = SwitchPolicy::default();
+        assert!(p.should_failover(), "默认开启");
+
+        p.failover_enabled = false;
+        assert!(!p.should_failover());
+
+        p.failover_enabled = true;
+        p.on_failure_action = crate::domain::model::OnFailureAction::Ignore;
+        assert!(!p.should_failover(), "action=none 等价于不转移");
+
+        p.on_failure_action = crate::domain::model::OnFailureAction::Retry;
+        assert!(p.should_failover());
+    }
+
+    #[test]
+    fn sanitize_clamps_failover_fields() {
+        let mut p = SwitchPolicy::default();
+        p.retry_interval_sec = 0; // 会变成忙轮询
+        p.max_retries = 999;
+        p.dwell_after_switch_sec = u32::MAX;
+        p.sanitize();
+
+        assert_eq!(p.retry_interval_sec, 1, "重试间隔不得为 0");
+        assert_eq!(p.max_retries, 10);
+        assert_eq!(p.dwell_after_switch_sec, 86_400);
+    }
+
+    #[test]
+    fn on_failure_action_parse_roundtrip() {
+        use crate::domain::model::OnFailureAction as A;
+        assert_eq!(A::parse("switch"), A::Switch);
+        assert_eq!(A::parse("retry"), A::Retry);
+        assert_eq!(A::parse("none"), A::Ignore);
+        assert_eq!(A::parse("garbage"), A::Switch, "未知值回退默认");
+        // 序列化名必须与契约一致
+        assert_eq!(A::Ignore.as_str(), "none");
+        assert_eq!(A::Switch.as_str(), "switch");
     }
 }

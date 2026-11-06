@@ -10,8 +10,10 @@ use crate::domain::errors::{AppError, AppResult, ErrorCode};
 use crate::kernel::{HttpKernelApi, KernelSupervisor, SelectorApi};
 use crate::scheduler::Scheduler;
 use crate::speedtest::SpeedtestEngine;
+use crate::store::rules_store::RulesStore;
 use crate::store::settings_store::{SettingsStore, SubscriptionStore};
 use crate::store::switch_history::SwitchHistoryStore;
+use crate::store::traffic_store::TrafficStore;
 use crate::subscription::SubscriptionManager;
 use crate::system::paths::Paths;
 use crate::system::sysproxy::SysProxyManager;
@@ -32,6 +34,10 @@ pub struct AppState {
     pub subs_store: Arc<SubscriptionStore>,
     pub subs: Arc<SubscriptionManager>,
     pub history: Arc<SwitchHistoryStore>,
+    /// 用户自定义规则库
+    pub rules: Arc<RulesStore>,
+    /// 流量统计（跨内核重启持久化）
+    pub traffic: Arc<TrafficStore>,
     pub sysproxy: Arc<SysProxyManager>,
     pub kernel: Arc<KernelSupervisor>,
     /// 内核 API（内核未运行时为 None）
@@ -51,11 +57,14 @@ impl AppState {
         let settings = Arc::new(SettingsStore::load(&paths)?);
         let subs_store = Arc::new(SubscriptionStore::load(&paths)?);
         let history = Arc::new(SwitchHistoryStore::load(&paths)?);
+        let rules = Arc::new(RulesStore::load(&paths)?);
+        let traffic = Arc::new(TrafficStore::load(&paths));
         let sysproxy = Arc::new(SysProxyManager::new(&paths));
         let subs = Arc::new(SubscriptionManager::new(
             Arc::clone(&paths),
             Arc::clone(&subs_store),
             Arc::clone(&settings),
+            Arc::clone(&rules),
         ));
 
         let (core_tx, _) = broadcast::channel(64);
@@ -68,6 +77,8 @@ impl AppState {
             subs_store,
             subs,
             history,
+            rules,
+            traffic,
             sysproxy,
             kernel,
             api: parking_lot::RwLock::new(None),
@@ -104,7 +115,7 @@ impl AppState {
         let (st_tx, _) = broadcast::channel(256);
         let (sw_tx, _) = broadcast::channel(256);
         let engine = SpeedtestEngine::new(
-            api,
+            Arc::clone(&api),
             Arc::clone(&self.history),
             st_tx,
             sw_tx,
@@ -117,6 +128,13 @@ impl AppState {
         });
         *self.speedtest.write() = Some(engine);
         *self.core_started_at.lock() = crate::util::time::now_secs();
+
+        // 调度器的流量采集需要内核 API，attach 后同步过去
+        let sched = { self.scheduler.read().clone() };
+        if let Some(sched) = sched {
+            sched.set_api(Some(Arc::clone(&api)));
+        }
+
         tracing::info!(api_port, "内核 API 已装配");
         Ok(())
     }
@@ -126,6 +144,26 @@ impl AppState {
         *self.api.write() = None;
         *self.speedtest.write() = None;
         *self.core_started_at.lock() = 0;
+        // 流量计数器随内核重启归零，基线必须一起清掉，
+        // 否则下次采集会把"旧的大值 → 新的小值"判成回退并丢失一段流量
+        self.traffic.reset_baseline();
+
+        // 调度器不能再拿着已失效的 API 去采集
+        let sched = { self.scheduler.read().clone() };
+        if let Some(sched) = sched {
+            sched.set_api(None);
+        }
+    }
+
+    /// 采集一次内核流量并落盘。返回本次增量（无内核时返回 None）。
+    ///
+    /// 由调度器每 60 秒调用一次，也可被 `traffic_stats` 命令顺手触发，
+    /// 保证用户点开流量页看到的是最新值。
+    pub async fn collect_traffic(&self) -> Option<(u64, u64)> {
+        let api = self.api.read().clone()?;
+        let totals = api.traffic_totals().await.ok()?;
+        self.traffic
+            .feed_cumulative(crate::util::time::now_secs(), totals.up, totals.down)
     }
 
     pub fn emit(&self, kind: &str, payload: serde_json::Value) {

@@ -1,6 +1,6 @@
 [package]
 name = "clash-zhengl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Clash Zhengl — 轻量级 Windows 代理客户端"
 authors = ["myxiaolizi <my@zhengl.vip>"]
 edition = "2021"

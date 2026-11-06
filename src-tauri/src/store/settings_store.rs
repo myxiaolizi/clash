@@ -94,6 +94,22 @@ fn migrate(mut s: AppSettings) -> AppSettings {
         }
     }
 
+    // v2 → v3：新增 mihomo_mode 与失败转移字段。
+    //
+    // 这些字段都有 `#[serde(default)]`，老文件缺字段时会被自动补上默认值，
+    // 所以不需要逐字段迁移。但**必须跑一次 sanitize**：
+    // 万一用户手改过 settings.json 塞进越界值（比如 retry_interval_sec=0
+    // 会造成忙轮询），升级后要在加载阶段就纠正掉，而不是等到运行时才出问题。
+    if from < 3 {
+        // mihomo_mode / 失败转移字段都有 serde default，缺字段自动补默认值，
+        // 不用逐字段迁移；但要跑一次 sanitize 纠正手改文件塞进的越界值。
+        s.switch_policy.sanitize();
+        tracing::debug!(
+            mode = s.mihomo_mode.as_str(),
+            "v2→v3: 已补全分流模式与失败转移默认值"
+        );
+    }
+
     s.schema_version = SETTINGS_SCHEMA_VERSION;
     s
 }
@@ -240,6 +256,95 @@ mod tests {
         // 磁盘上也应是 15
         let store2 = SettingsStore::load(&paths).unwrap();
         assert_eq!(store2.get().sub_default_interval_min, 15);
+    }
+
+    /// 构造一份"真实"的 v2 settings.json：字段齐全，但删掉 v3 才有的键。
+    ///
+    /// 不能手写两三行 JSON —— `AppSettings` 大部分字段没有 serde default，
+    /// 缺字段会整体反序列化失败并回退到默认值，那样测的就不是迁移而是兜底了。
+    fn v2_json() -> String {
+        let mut v = serde_json::to_value(AppSettings::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert("schema_version".into(), serde_json::json!(2));
+        obj.remove("mihomo_mode");
+        if let Some(p) = obj.get_mut("switch_policy").and_then(|p| p.as_object_mut()) {
+            for k in [
+                "on_failure_action",
+                "failover_enabled",
+                "retry_interval_sec",
+                "max_retries",
+                "dwell_after_switch_sec",
+                "prefer_healthy_only",
+            ] {
+                p.remove(k);
+            }
+        }
+        serde_json::to_string(&v).unwrap()
+    }
+
+    #[test]
+    fn migrate_v2_to_v3_fills_new_fields() {
+        let (_d, paths) = setup();
+        std::fs::write(paths.settings_file(), v2_json()).unwrap();
+
+        let store = SettingsStore::load(&paths).unwrap();
+        let s = store.get();
+
+        assert_eq!(s.schema_version, SETTINGS_SCHEMA_VERSION);
+        // 新字段走 serde default
+        assert_eq!(s.mihomo_mode, crate::domain::model::MihomoMode::Rule);
+        assert!(s.switch_policy.failover_enabled);
+        assert_eq!(
+            s.switch_policy.on_failure_action,
+            crate::domain::model::OnFailureAction::Switch
+        );
+        // 老字段必须原样保留（证明是真读进来了，不是兜底默认值）
+        assert_eq!(s.sub_default_interval_min, 360);
+    }
+
+    #[test]
+    fn migrate_sanitizes_hand_edited_out_of_range() {
+        let (_d, paths) = setup();
+        // 用户手改 settings.json 塞了会忙轮询的 0 和超大的重试次数。
+        //
+        // 注意不能只留两个字段：SwitchPolicy 大部分字段没有 serde default，
+        // 缺字段会让整个 AppSettings 反序列化失败并回退默认值 ——
+        // 那样测到的是"兜底"而不是"纠正越界值"。
+        let mut v: serde_json::Value = serde_json::from_str(&v2_json()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("schema_version".into(), serde_json::json!(2));
+        {
+            let p = v
+                .get_mut("switch_policy")
+                .and_then(|p| p.as_object_mut())
+                .unwrap();
+            p.insert("retry_interval_sec".into(), serde_json::json!(0));
+            p.insert("max_retries".into(), serde_json::json!(999));
+        }
+        std::fs::write(paths.settings_file(), serde_json::to_string(&v).unwrap()).unwrap();
+
+        let store = SettingsStore::load(&paths).unwrap();
+        let p = &store.get().switch_policy;
+        assert_eq!(p.retry_interval_sec, 1, "加载时必须纠正 0");
+        assert_eq!(p.max_retries, 10, "加载时必须夹住 999");
+    }
+
+    #[test]
+    fn migrate_keeps_existing_mihomo_mode() {
+        let (_d, paths) = setup();
+        let mut v: serde_json::Value = serde_json::from_str(&v2_json()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("mihomo_mode".into(), serde_json::json!("global"));
+        std::fs::write(paths.settings_file(), serde_json::to_string(&v).unwrap()).unwrap();
+
+        let store = SettingsStore::load(&paths).unwrap();
+        assert_eq!(
+            store.get().mihomo_mode,
+            crate::domain::model::MihomoMode::Global,
+            "已有值不得被迁移覆盖"
+        );
     }
 
     #[test]

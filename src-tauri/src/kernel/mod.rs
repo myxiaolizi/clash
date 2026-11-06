@@ -5,5 +5,5 @@ pub mod fetch_core;
 pub mod ports;
 pub mod supervisor;
 
-pub use api::{ApiFuture, HttpKernelApi, SelectorApi, SELECTOR_KIND};
+pub use api::{ApiFuture, HttpKernelApi, SelectorApi, TrafficTotals, SELECTOR_KIND};
 pub use supervisor::{CoreLaunchSpec, KernelSupervisor};

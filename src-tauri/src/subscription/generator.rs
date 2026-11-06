@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::domain::errors::{AppError, AppResult, ErrorCode};
+use crate::domain::model::MihomoMode;
 
 /// 主组名（固定，前端与切换逻辑都依赖它）
 pub const MAIN_GROUP_DEFAULT: &str = "Proxy";
@@ -39,6 +40,15 @@ pub struct GenerateInput<'a> {
     pub log_level: &'a str,
     /// 是否有 TUN 需求（决定 dns.enable 与 tun 段）
     pub tun_enabled: bool,
+    /// 内核分流模式（rule / global / direct）。
+    ///
+    /// 早期这里是硬编码 `mode: rule`，用户切「全局」只改了个前端开关，
+    /// 配置里还是 rule，于是"全局模式不生效"——这是必须写进配置的字段。
+    pub mihomo_mode: MihomoMode,
+    /// 用户自定义规则（已渲染成 `TYPE,value,target` 行，顺序即优先级）。
+    ///
+    /// 插在 rules 段**最前**：用户的显式意图优先级高于我们兜底的 MATCH。
+    pub user_rules: Vec<String>,
 }
 
 pub struct SubNodes<'a> {
@@ -149,7 +159,8 @@ pub fn generate(input: &GenerateInput<'_>) -> AppResult<Generated> {
     root.insert(s("mixed-port"), n(input.mixed_port as u64));
     root.insert(s("allow-lan"), b(false));
     root.insert(s("bind-address"), s("127.0.0.1"));
-    root.insert(s("mode"), s("rule"));
+    // 分流模式必须真正写进配置，否则前端切「全局」不生效
+    root.insert(s("mode"), s(input.mihomo_mode.as_str()));
     root.insert(s("log-level"), s(input.log_level));
     // 约束 3：strict，不能用 off
     root.insert(s("find-process-mode"), s("strict"));
@@ -206,10 +217,16 @@ pub fn generate(input: &GenerateInput<'_>) -> AppResult<Generated> {
     let mut groups_seq = vec![Value::Mapping(group)];
     root.insert(s("proxy-groups"), Value::Sequence(groups_seq.drain(..).collect()));
 
-    // 规则：全部走主组（用户可在节点里手动选）
+    // 规则：用户规则在前（显式意图优先），最后兜底 MATCH 走主组
+    let mut rules: Vec<String> = input.user_rules.clone();
+    rules.push(format!("MATCH,{}", input.main_group));
+    // 去重保序：用户可能手抖加了两条一样的关键词规则，
+    // mihomo 对重复规则不报错但会浪费匹配；顺手清掉更干净。
+    let mut seen_rule = std::collections::HashSet::new();
+    rules.retain(|r| seen_rule.insert(r.clone()));
     root.insert(
         s("rules"),
-        Value::Sequence(vec![s(&format!("MATCH,{}", input.main_group))]),
+        Value::Sequence(rules.iter().map(|r| s(r)).collect()),
     );
 
     // ---- 4. 序列化 ----
@@ -349,6 +366,8 @@ mod tests {
             main_group: MAIN_GROUP_DEFAULT.to_string(),
             log_level: "info",
             tun_enabled: false,
+            mihomo_mode: MihomoMode::Rule,
+            user_rules: Vec::new(),
         }
     }
 
@@ -619,6 +638,100 @@ profile:
         }];
         let g = generate(&base_input(subs)).unwrap();
         assert!(g.yaml.contains("MATCH,Proxy"));
+    }
+
+    // ---- v3：分流模式 ----
+
+    fn one_node_input() -> Vec<SubNodes<'static>> {
+        vec![SubNodes {
+            sub_name: "A",
+            prefix: false,
+            proxies: vec![proxy("n1", "ss")],
+        }]
+    }
+
+    #[test]
+    fn mode_rule_written_by_default() {
+        let g = generate(&base_input(one_node_input())).unwrap();
+        let doc: Value = serde_yaml_ng::from_str(&g.yaml).unwrap();
+        let mode = doc
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("mode".into()))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(mode, "rule");
+    }
+
+    #[test]
+    fn mode_global_actually_written() {
+        // 回归：早期 mode 硬编码 rule，切「全局」只改了前端开关，配置没变
+        let mut input = base_input(one_node_input());
+        input.mihomo_mode = MihomoMode::Global;
+        let g = generate(&input).unwrap();
+        let doc: Value = serde_yaml_ng::from_str(&g.yaml).unwrap();
+        let mode = doc
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("mode".into()))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(mode, "global", "全局模式必须写进配置");
+    }
+
+    #[test]
+    fn mode_direct_actually_written() {
+        let mut input = base_input(one_node_input());
+        input.mihomo_mode = MihomoMode::Direct;
+        let g = generate(&input).unwrap();
+        assert!(g.yaml.contains("mode: direct"));
+    }
+
+    // ---- v3：用户规则 ----
+
+    #[test]
+    fn user_rules_come_before_match() {
+        let mut input = base_input(one_node_input());
+        input.user_rules = vec![
+            "DOMAIN-SUFFIX,google.com,Proxy".into(),
+            "DOMAIN-KEYWORD,ads,REJECT".into(),
+        ];
+        let g = generate(&input).unwrap();
+        let doc: Value = serde_yaml_ng::from_str(&g.yaml).unwrap();
+        let rules = doc
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("rules".into()))
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].as_str(), Some("DOMAIN-SUFFIX,google.com,Proxy"));
+        assert_eq!(rules[1].as_str(), Some("DOMAIN-KEYWORD,ads,REJECT"));
+        // MATCH 必须是最后一条，否则它上面的规则永远不生效
+        assert_eq!(rules[2].as_str(), Some("MATCH,Proxy"));
+    }
+
+    #[test]
+    fn duplicate_user_rules_deduped() {
+        let mut input = base_input(one_node_input());
+        input.user_rules = vec![
+            "DOMAIN,a.com,DIRECT".into(),
+            "DOMAIN,a.com,DIRECT".into(),
+        ];
+        let g = generate(&input).unwrap();
+        let doc: Value = serde_yaml_ng::from_str(&g.yaml).unwrap();
+        let rules = doc
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("rules".into()))
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        assert_eq!(rules.len(), 2, "重复规则应被去掉，只剩一条 + MATCH");
     }
 
     #[test]

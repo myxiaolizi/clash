@@ -9,21 +9,28 @@
     <Grid x:Name="RootGrid" Background="Transparent">
 
         <Grid.RowDefinitions>
-            <RowDefinition Height="40" />   <!-- 自绘标题栏 -->
+            <RowDefinition Height="40" />   <!-- 标题栏 -->
             <RowDefinition Height="*" />    <!-- 主体 -->
             <RowDefinition Height="28" />   <!-- 状态栏 -->
         </Grid.RowDefinitions>
 
         <!-- ============================================================
-             标题栏：可拖动 + 系统按钮
-             用 InputNonClientPointerSource 把这一条设为标题栏区域，
-             这样拖动、双击最大化、贴边分屏等系统行为都能正常工作。
+             标题栏：应用图标 + 名称 + 状态标签 + 拖拽区
+
+             这里**不再自绘最小化/最大化/关闭按钮**。
+             0.1.0 用三个 46x40 的自绘按钮放在第 2 列，但它们和
+             Windows 自己画在窗口右上角的系统按钮位置完全重合，
+             结果出现两套按钮叠在一起。
+
+             现在的做法：只保留一条可拖拽区交给 SetTitleBar()，
+             三个窗口按钮完全由系统提供——位置、悬停态、高亮、
+             无障碍、贴边分屏都跟随系统，不可能再错位。
+             系统按钮占用的宽度由 WinUI 自动从拖拽区里扣除。
              ============================================================ -->
         <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
             <!-- 应用图标 + 名称 -->
@@ -42,30 +49,8 @@
                 </Border>
             </StackPanel>
 
-            <!-- 空白可拖拽区 -->
+            <!-- 可拖拽区：一直延伸到窗口右边缘，系统按钮区域会自动被排除 -->
             <Border Grid.Column="1" x:Name="DragArea" Background="Transparent" />
-
-            <!-- 窗口按钮 -->
-            <StackPanel Grid.Column="2" Orientation="Horizontal" x:Name="CaptionButtons">
-                <Button x:Name="BtnMinimize" Click="OnMinimizeClick"
-                        Width="46" Height="40" CornerRadius="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="最小化">
-                    <FontIcon Glyph="&#xE921;" FontSize="10" />
-                </Button>
-                <Button x:Name="BtnMaximize" Click="OnMaximizeClick"
-                        Width="46" Height="40" CornerRadius="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="最大化">
-                    <FontIcon Glyph="&#xE922;" FontSize="10" />
-                </Button>
-                <Button x:Name="BtnClose" Click="OnCloseClick"
-                        Width="46" Height="40" CornerRadius="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="关闭">
-                    <FontIcon Glyph="&#xE8BB;" FontSize="10" />
-                </Button>
-            </StackPanel>
         </Grid>
 
         <!-- ============================================================
@@ -85,7 +70,14 @@
                           Background="Transparent" BorderThickness="0"
                           ItemContainerStyle="{StaticResource NavItemStyle}"
                           Padding="0,8,0,0">
-                    <ListViewItem Tag="subscriptions" IsSelected="True">
+                    <ListViewItem Tag="home" IsSelected="True">
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <FontIcon Glyph="&#xE80F;" FontSize="16"
+                                      Foreground="{ThemeResource TextSecondaryBrush}" />
+                            <TextBlock Text="首页" FontSize="13.5" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="subscriptions">
                         <StackPanel Orientation="Horizontal" Spacing="12">
                             <FontIcon Glyph="&#xE8A5;" FontSize="16"
                                       Foreground="{ThemeResource TextSecondaryBrush}" />
@@ -106,6 +98,13 @@
                             <TextBlock Text="节点" FontSize="13.5" VerticalAlignment="Center" />
                         </StackPanel>
                     </ListViewItem>
+                    <ListViewItem Tag="rules">
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <FontIcon Glyph="&#xE71C;" FontSize="16"
+                                      Foreground="{ThemeResource TextSecondaryBrush}" />
+                            <TextBlock Text="规则" FontSize="13.5" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </ListViewItem>
                     <ListViewItem Tag="settings">
                         <StackPanel Orientation="Horizontal" Spacing="12">
                             <FontIcon Glyph="&#xE713;" FontSize="16"
@@ -116,9 +115,15 @@
                 </ListView>
             </Border>
 
-            <!-- 右侧内容区：四个页面叠放，靠 Visibility 切换（保留滚动位置） -->
+            <!-- 右侧内容区：六个页面叠放，靠 Visibility 切换（保留滚动位置） -->
             <Grid Grid.Column="1">
+                <ScrollViewer x:Name="PageHome" Padding="28,22,28,28"
+                              VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="HomeHost" Spacing="16" />
+                </ScrollViewer>
+
                 <ScrollViewer x:Name="PageSubscriptions" Padding="28,22,28,28"
+                              Visibility="Collapsed"
                               VerticalScrollBarVisibility="Auto">
                     <StackPanel x:Name="SubscriptionsHost" Spacing="16" />
                 </ScrollViewer>
@@ -133,6 +138,12 @@
                               Visibility="Collapsed"
                               VerticalScrollBarVisibility="Auto">
                     <StackPanel x:Name="NodesHost" Spacing="16" />
+                </ScrollViewer>
+
+                <ScrollViewer x:Name="PageRules" Padding="28,22,28,28"
+                              Visibility="Collapsed"
+                              VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="RulesHost" Spacing="16" />
                 </ScrollViewer>
 
                 <ScrollViewer x:Name="PageSettings" Padding="28,22,28,28"
@@ -178,8 +189,8 @@
              启动遮罩：daemon 就绪前挡住内容，避免闪空列表。
              从第 1 行开始，**不遮标题栏**，这样启动中也能看到应用名与窗口按钮。
              ============================================================ -->
-        <Grid x:Name="BootOverlay" Grid.Row="1" Grid.ColumnSpan="1"
-              Grid.RowSpan="1" Background="{ThemeResource AppBgBrush}">
+        <Grid x:Name="BootOverlay" Grid.Row="1"
+              Background="{ThemeResource AppBgBrush}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="180" />
                 <ColumnDefinition Width="*" />
