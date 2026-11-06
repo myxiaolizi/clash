@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>ClashZhengl</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <PublishProfile>win-$(Platform).pubxml</PublishProfile>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <!-- 非打包：免 MSIX，可直接双击 exe 运行 -->
+    <WindowsPackageType>None</WindowsPackageType>
+
+    <!-- 自包含 Windows App SDK：把 WinUI 原生 DLL 一起输出。
+         必须开：本机只有 WindowsAppRuntime 1.4/1.5/1.8，没有 1.6，
+         框架依赖模式下会报 "This application could not be started"。
+         自包含也让便携包不挑机器，符合交付要求。 -->
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- 阻止 XAML 编译器生成 Main。
+         未打包模式必须自己初始化 COM 公寓，且单实例检查要早于 Application.Start，
+         因此入口由 Program.cs 手写。 -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <AssemblyName>ClashZhengl</AssemblyName>
+    <AssemblyTitle>Clash Zhengl</AssemblyTitle>
+    <Product>Clash Zhengl</Product>
+    <Version>0.1.0</Version>
+    <Company>myxiaolizi</Company>
+    <Copyright>MIT License</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.241114003" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

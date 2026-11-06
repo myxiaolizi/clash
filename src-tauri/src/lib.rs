@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod commands;
+pub mod daemon;
 pub mod domain;
 pub mod kernel;
 pub mod scheduler;

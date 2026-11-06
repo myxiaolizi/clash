@@ -14,6 +14,12 @@ default-run = "clash-zhengl"
 name = "clash-zhengl"
 path = "src/main.rs"
 
+# 内核守护进程：WinUI 3 前端通过本地 HTTP 调用它。
+# 与 GUI 分离进程的好处：GUI 崩溃不拖垮内核、内核可独立重启。
+[[bin]]
+name = "clash-zhengl-daemon"
+path = "src/bin/daemon.rs"
+
 [lib]
 name = "clash_zhengl_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -34,6 +40,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 
+# ---------- 本地 IPC HTTP 服务（daemon 模式）----------
+# 用 hyper + http-body-util 而非 axum：axum 会多带 tower/tokio-full，
+# daemon 只需要一个极小的请求路由，手写路由体积更小、启动更快。
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+
 # ---------- 异步运行时（单线程，见 02 章 ADR-02） ----------
 tokio = { version = "1", default-features = false, features = [
     "rt",
@@ -43,6 +57,7 @@ tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
     "process",
+    "signal",
 ] }
 
 # ---------- HTTP（rustls，不引入 OpenSSL 依赖） ----------

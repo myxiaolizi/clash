@@ -8,22 +8,17 @@ use tauri::State;
 
 use crate::commands::dto::*;
 use crate::commands::state::AppHandleState;
-use crate::domain::errors::{AppError, ErrorCode};
+use crate::domain::errors::{AppError, AppResult, ErrorCode};
 use crate::domain::model::{LogLevel, ProxyMode, Theme};
 
 type R<T> = Result<T, IpcError>;
-
-fn st<'a>(s: &'a State<'_, AppHandleState>) -> &'a Arc<crate::commands::state::AppState> {
-    &s.0
-}
 
 // ============================================================================
 //  app
 // ============================================================================
 
-#[tauri::command]
-pub async fn app_info(state: State<'_, AppHandleState>) -> R<AppInfoDto> {
-    let s = st(&state);
+pub async fn app_info_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<AppInfoDto> {
+    
     let settings = s.settings.get();
     Ok(AppInfoDto {
         version: crate::VERSION.to_string(),
@@ -35,37 +30,58 @@ pub async fn app_info(state: State<'_, AppHandleState>) -> R<AppInfoDto> {
     })
 }
 
-/// 首次启动合规提示：用户接受后记录时间
 #[tauri::command]
-pub async fn app_accept_compliance(state: State<'_, AppHandleState>) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn app_info(state: State<'_, AppHandleState>) -> R<AppInfoDto> {
+    app_info_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 首次启动合规提示：用户接受后记录时间
+pub async fn app_accept_compliance_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    
     s.settings
         .update(|x| x.compliance_accepted_at = Some(crate::util::time::now_secs()))
-        .map_err(IpcError::from)?;
+        ?;
     Ok(OpResultDto::ok("已记录"))
 }
 
 #[tauri::command]
-pub async fn app_open_data_dir(state: State<'_, AppHandleState>) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn app_accept_compliance(state: State<'_, AppHandleState>) -> R<OpResultDto> {
+    app_accept_compliance_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn app_open_data_dir_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    
     let p = s.paths.roaming.to_string_lossy().to_string();
     open_in_explorer(&p)?;
     Ok(OpResultDto::ok("已打开数据目录"))
 }
 
 #[tauri::command]
-pub async fn app_open_log_dir(state: State<'_, AppHandleState>) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn app_open_data_dir(state: State<'_, AppHandleState>) -> R<OpResultDto> {
+    app_open_data_dir_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn app_open_log_dir_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    
     let p = s.paths.logs_dir().to_string_lossy().to_string();
     open_in_explorer(&p)?;
     Ok(OpResultDto::ok("已打开日志目录"))
 }
 
-fn open_in_explorer(path: &str) -> R<()> {
+#[tauri::command]
+pub async fn app_open_log_dir(state: State<'_, AppHandleState>) -> R<OpResultDto> {
+    app_open_log_dir_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub fn open_in_explorer(path: &str) -> AppResult<()> {
     std::process::Command::new("explorer.exe")
         .arg(path)
         .spawn()
-        .map_err(|e| IpcError::from(AppError::with_detail(ErrorCode::Internal, e)))?;
+        .map_err(|e| AppError::with_detail(ErrorCode::Internal, e))?;
     Ok(())
 }
 
@@ -73,28 +89,35 @@ fn open_in_explorer(path: &str) -> R<()> {
 //  settings
 // ============================================================================
 
-#[tauri::command]
-pub async fn settings_get(state: State<'_, AppHandleState>) -> R<SettingsDto> {
-    let s = st(&state);
+pub async fn settings_get_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<SettingsDto> {
+    
     Ok(SettingsDto::from(&s.settings.get()))
 }
 
 #[tauri::command]
-pub async fn settings_update(
-    state: State<'_, AppHandleState>,
-    patch: SettingsPatch,
-) -> R<SettingsDto> {
-    let s = st(&state);
+pub async fn settings_get(state: State<'_, AppHandleState>) -> R<SettingsDto> {
+    settings_get_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn settings_update_inner(s: &Arc<crate::commands::state::AppState>, patch: SettingsPatch) -> AppResult<SettingsDto> {
+    
     let updated = s
         .settings
         .update(|x| apply_patch(x, &patch))
-        .map_err(IpcError::from)?;
+        ?;
 
     // 设置变更后同步副作用
     sync_side_effects(s, &updated);
 
     Ok(SettingsDto::from(&updated))
 }
+
+#[tauri::command]
+pub async fn settings_update(state: State<'_, AppHandleState>, patch: SettingsPatch) -> R<SettingsDto> {
+    settings_update_inner(&state.0, patch).await.map_err(IpcError::from)
+}
+
 
 fn apply_patch(x: &mut crate::domain::model::AppSettings, p: &SettingsPatch) {
     if let Some(v) = &p.locale {
@@ -224,9 +247,8 @@ fn sync_side_effects(
 //  core
 // ============================================================================
 
-#[tauri::command]
-pub async fn core_status(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
-    let s = st(&state);
+pub async fn core_status_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<CoreStatusDto> {
+    
     let st_ = s.kernel.state();
     let ports = s.kernel.actual_ports();
     let settings = s.settings.get();
@@ -250,41 +272,61 @@ pub async fn core_status(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
 }
 
 #[tauri::command]
-pub async fn core_start(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
-    let s = st(&state);
-    crate::app::start_core(s).await.map_err(IpcError::from)?;
-    core_status(state).await
+pub async fn core_status(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
+    core_status_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn core_start_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<CoreStatusDto> {
+    
+    crate::app::start_core(s).await?;
+    core_status_inner(s).await
 }
 
 #[tauri::command]
-pub async fn core_stop(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
-    let s = st(&state);
+pub async fn core_start(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
+    core_start_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn core_stop_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<CoreStatusDto> {
+    
     // 停止前先撤掉系统代理，否则断网
     if s.sysproxy.read_state().managed_by_us {
         let _ = s.sysproxy.disable();
     }
-    s.kernel.stop().await.map_err(IpcError::from)?;
+    s.kernel.stop().await?;
     s.detach_core();
     s.emit("core:state", serde_json::json!({"state": "stopped"}));
-    core_status(state).await
+    core_status_inner(s).await
 }
 
 #[tauri::command]
-pub async fn core_restart(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
-    let s = st(&state);
+pub async fn core_stop(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
+    core_stop_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn core_restart_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<CoreStatusDto> {
+    
     if s.sysproxy.read_state().managed_by_us {
         let _ = s.sysproxy.disable();
     }
     let _ = s.kernel.stop().await;
     s.detach_core();
-    crate::app::start_core(s).await.map_err(IpcError::from)?;
-    core_status(state).await
+    crate::app::start_core(s).await?;
+    core_status_inner(s).await
 }
 
-/// 列出已安装内核版本
 #[tauri::command]
-pub async fn core_list_versions(state: State<'_, AppHandleState>) -> R<Vec<InstalledCoreDto>> {
-    let s = st(&state);
+pub async fn core_restart(state: State<'_, AppHandleState>) -> R<CoreStatusDto> {
+    core_restart_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 列出已安装内核版本
+pub async fn core_list_versions_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<Vec<InstalledCoreDto>> {
+    
     let active = s.settings.get().core_version;
     Ok(crate::kernel::fetch_core::list_installed(&s.paths)
         .into_iter()
@@ -297,13 +339,15 @@ pub async fn core_list_versions(state: State<'_, AppHandleState>) -> R<Vec<Insta
         .collect())
 }
 
-/// 下载并安装内核（异步，进度通过事件推送）
 #[tauri::command]
-pub async fn core_install(
-    state: State<'_, AppHandleState>,
-    version: Option<String>,
-) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn core_list_versions(state: State<'_, AppHandleState>) -> R<Vec<InstalledCoreDto>> {
+    core_list_versions_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 下载并安装内核（异步，进度通过事件推送）
+pub async fn core_install_inner(s: &Arc<crate::commands::state::AppState>, version: Option<String>) -> AppResult<OpResultDto> {
+    
     let version = version
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| crate::kernel::fetch_core::DEFAULT_CORE_VERSION.to_string());
@@ -360,24 +404,34 @@ pub async fn core_install(
     Ok(OpResultDto::ok(format!("已开始下载内核 {version}")))
 }
 
+#[tauri::command]
+pub async fn core_install(state: State<'_, AppHandleState>, version: Option<String>) -> R<OpResultDto> {
+    core_install_inner(&state.0, version).await.map_err(IpcError::from)
+}
+
+
 // ============================================================================
 //  sysproxy
 // ============================================================================
 
-#[tauri::command]
-pub async fn sysproxy_get(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
-    let s = st(&state);
+pub async fn sysproxy_get_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<RuntimeDto> {
+    
     Ok(runtime_dto(s))
 }
 
 #[tauri::command]
-pub async fn sysproxy_enable(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
-    let s = st(&state);
+pub async fn sysproxy_get(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
+    sysproxy_get_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn sysproxy_enable_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<RuntimeDto> {
+    
     let ports = s
         .kernel
         .actual_ports()
-        .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::CoreNotRunning)))?;
-    s.sysproxy.enable(ports.0).map_err(IpcError::from)?;
+        .ok_or_else(|| AppError::new(ErrorCode::CoreNotRunning))?;
+    s.sysproxy.enable(ports.0)?;
     s.emit(
         "sysproxy:changed",
         serde_json::json!({"enabled": true, "port": ports.0}),
@@ -386,12 +440,23 @@ pub async fn sysproxy_enable(state: State<'_, AppHandleState>) -> R<RuntimeDto> 
 }
 
 #[tauri::command]
-pub async fn sysproxy_disable(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
-    let s = st(&state);
-    s.sysproxy.disable().map_err(IpcError::from)?;
+pub async fn sysproxy_enable(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
+    sysproxy_enable_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn sysproxy_disable_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<RuntimeDto> {
+    
+    s.sysproxy.disable()?;
     s.emit("sysproxy:changed", serde_json::json!({"enabled": false}));
     Ok(runtime_dto(s))
 }
+
+#[tauri::command]
+pub async fn sysproxy_disable(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
+    sysproxy_disable_inner(&state.0).await.map_err(IpcError::from)
+}
+
 
 pub fn runtime_dto(s: &Arc<crate::commands::state::AppState>) -> RuntimeDto {
     let sy = s.sysproxy.read_state();
@@ -429,13 +494,21 @@ pub fn runtime_dto(s: &Arc<crate::commands::state::AppState>) -> RuntimeDto {
 //  runtime
 // ============================================================================
 
-#[tauri::command]
-pub async fn runtime_get(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
-    let s = st(&state);
+pub async fn runtime_get_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<RuntimeDto> {
+    
     Ok(runtime_dto(s))
 }
 
+#[tauri::command]
+pub async fn runtime_get(state: State<'_, AppHandleState>) -> R<RuntimeDto> {
+    runtime_get_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
 /// 打开窗口（托盘菜单用）
+///
+/// 窗口类操作依赖 Tauri 的 AppHandle，**不提取 `_inner`**：
+/// daemon 进程里没有窗口，这些命令只存在于 Tauri 侧。
 #[tauri::command]
 pub async fn runtime_show_window(app: tauri::AppHandle) -> R<OpResultDto> {
     use tauri::Manager;
@@ -474,7 +547,7 @@ pub async fn window_toggle_maximize(app: tauri::AppHandle) -> R<OpResultDto> {
 #[tauri::command]
 pub async fn window_close(app: tauri::AppHandle, state: State<'_, AppHandleState>) -> R<OpResultDto> {
     use tauri::Manager;
-    let s = st(&state);
+    let s = &state.0;
     let to_tray = s.settings.get().close_to_tray;
     if let Some(w) = app.get_webview_window("main") {
         if to_tray {
@@ -490,7 +563,6 @@ pub async fn window_close(app: tauri::AppHandle, state: State<'_, AppHandleState
     }
     Ok(OpResultDto::ok("ok"))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

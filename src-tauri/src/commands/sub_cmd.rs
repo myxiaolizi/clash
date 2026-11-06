@@ -6,28 +6,24 @@ use tauri::State;
 
 use crate::commands::dto::*;
 use crate::commands::state::AppHandleState;
-use crate::domain::errors::{AppError, ErrorCode};
+use crate::domain::errors::{AppError, AppResult, ErrorCode};
 
 type R<T> = Result<T, IpcError>;
 
-fn st<'a>(s: &'a State<'_, AppHandleState>) -> &'a Arc<crate::commands::state::AppState> {
-    &s.0
-}
-
-#[tauri::command]
-pub async fn subscription_list(state: State<'_, AppHandleState>) -> R<Vec<SubscriptionDto>> {
-    let s = st(&state);
+pub async fn subscription_list_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<Vec<SubscriptionDto>> {
+    
     Ok(s.subs.list().iter().map(SubscriptionDto::from).collect())
 }
 
 #[tauri::command]
-pub async fn subscription_add(
-    state: State<'_, AppHandleState>,
-    name: String,
-    url: String,
-) -> R<SubscriptionDto> {
-    let s = st(&state);
-    let sub = s.subs.add(&name, &url).map_err(IpcError::from)?;
+pub async fn subscription_list(state: State<'_, AppHandleState>) -> R<Vec<SubscriptionDto>> {
+    subscription_list_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn subscription_add_inner(s: &Arc<crate::commands::state::AppState>, name: String, url: String) -> AppResult<SubscriptionDto> {
+    
+    let sub = s.subs.add(&name, &url)?;
     s.emit(
         "subscription:added",
         serde_json::json!({"uid": sub.uid, "name": sub.name}),
@@ -36,56 +32,61 @@ pub async fn subscription_add(
 }
 
 #[tauri::command]
-pub async fn subscription_remove(state: State<'_, AppHandleState>, uid: String) -> R<OpResultDto> {
-    let s = st(&state);
-    s.subs.remove(&uid).map_err(IpcError::from)?;
+pub async fn subscription_add(state: State<'_, AppHandleState>, name: String, url: String) -> R<SubscriptionDto> {
+    subscription_add_inner(&state.0, name, url).await.map_err(IpcError::from)
+}
+
+
+pub async fn subscription_remove_inner(s: &Arc<crate::commands::state::AppState>, uid: String) -> AppResult<OpResultDto> {
+    
+    s.subs.remove(&uid)?;
     s.emit("subscription:removed", serde_json::json!({"uid": uid}));
     Ok(OpResultDto::ok("已删除"))
 }
 
 #[tauri::command]
-pub async fn subscription_update(
-    state: State<'_, AppHandleState>,
-    uid: String,
-    name: Option<String>,
-    enabled: Option<bool>,
-    interval_min: Option<u32>,
-) -> R<SubscriptionDto> {
-    let s = st(&state);
+pub async fn subscription_remove(state: State<'_, AppHandleState>, uid: String) -> R<OpResultDto> {
+    subscription_remove_inner(&state.0, uid).await.map_err(IpcError::from)
+}
+
+
+pub async fn subscription_update_inner(s: &Arc<crate::commands::state::AppState>, uid: String, name: Option<String>, enabled: Option<bool>, interval_min: Option<u32>) -> AppResult<SubscriptionDto> {
+    
     let mut sub = if let Some(n) = name {
-        s.subs.rename(&uid, &n).map_err(IpcError::from)?
+        s.subs.rename(&uid, &n)?
     } else {
         s.subs_store
             .get(&uid)
-            .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::NotFound)))?
+            .ok_or_else(|| AppError::new(ErrorCode::NotFound))?
     };
     if let Some(e) = enabled {
-        sub = s.subs.set_enabled(&uid, e).map_err(IpcError::from)?;
+        sub = s.subs.set_enabled(&uid, e)?;
     }
     if let Some(i) = interval_min {
-        sub = s.subs.update_interval(&uid, i).map_err(IpcError::from)?;
+        sub = s.subs.update_interval(&uid, i)?;
     }
     Ok(SubscriptionDto::from(&sub))
 }
 
-/// 拉取单个订阅
 #[tauri::command]
-pub async fn subscription_fetch(
-    state: State<'_, AppHandleState>,
-    uid: String,
-    force: Option<bool>,
-) -> R<SubscriptionDto> {
-    let s = st(&state);
+pub async fn subscription_update(state: State<'_, AppHandleState>, uid: String, name: Option<String>, enabled: Option<bool>, interval_min: Option<u32>) -> R<SubscriptionDto> {
+    subscription_update_inner(&state.0, uid, name, enabled, interval_min).await.map_err(IpcError::from)
+}
+
+
+/// 拉取单个订阅
+pub async fn subscription_fetch_inner(s: &Arc<crate::commands::state::AppState>, uid: String, force: Option<bool>) -> AppResult<SubscriptionDto> {
+    
     let parsed = s
         .subs
         .fetch_one(&uid, force.unwrap_or(false))
         .await
-        .map_err(IpcError::from)?;
+        ?;
 
     let sub = s
         .subs_store
         .get(&uid)
-        .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::NotFound)))?;
+        .ok_or_else(|| AppError::new(ErrorCode::NotFound))?;
 
     s.emit(
         "subscription:fetched",
@@ -97,10 +98,15 @@ pub async fn subscription_fetch(
     Ok(SubscriptionDto::from(&sub))
 }
 
-/// 拉取全部（用户点"全部更新"）
 #[tauri::command]
-pub async fn subscription_fetch_all(state: State<'_, AppHandleState>) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn subscription_fetch(state: State<'_, AppHandleState>, uid: String, force: Option<bool>) -> R<SubscriptionDto> {
+    subscription_fetch_inner(&state.0, uid, force).await.map_err(IpcError::from)
+}
+
+
+/// 拉取全部（用户点"全部更新"）
+pub async fn subscription_fetch_all_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    
     let results = s.subs.fetch_due(true).await;
     let total = results.len();
     let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
@@ -120,34 +126,44 @@ pub async fn subscription_fetch_all(state: State<'_, AppHandleState>) -> R<OpRes
 }
 
 #[tauri::command]
-pub async fn subscription_traffic(state: State<'_, AppHandleState>) -> R<TrafficSummaryDto> {
-    let s = st(&state);
+pub async fn subscription_fetch_all(state: State<'_, AppHandleState>) -> R<OpResultDto> {
+    subscription_fetch_all_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn subscription_traffic_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<TrafficSummaryDto> {
+    
     let summary = s.subs.traffic_summary();
     Ok(TrafficSummaryDto::from(&summary))
 }
 
-/// 手动应用当前配置到内核（无需等定时任务）
 #[tauri::command]
-pub async fn subscription_apply(state: State<'_, AppHandleState>) -> R<OpResultDto> {
-    let s = st(&state);
+pub async fn subscription_traffic(state: State<'_, AppHandleState>) -> R<TrafficSummaryDto> {
+    subscription_traffic_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 手动应用当前配置到内核（无需等定时任务）
+pub async fn subscription_apply_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<OpResultDto> {
+    
 
     let ports = s
         .kernel
         .actual_ports()
-        .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::CoreNotRunning)))?;
+        .ok_or_else(|| AppError::new(ErrorCode::CoreNotRunning))?;
     let secret = s.secret.read().clone();
     if secret.is_empty() {
-        return Err(IpcError::from(AppError::new(ErrorCode::CoreApiUnauth)));
+        return Err(AppError::new(ErrorCode::CoreApiUnauth));
     }
 
     let gen = s
         .subs
         .build_config(ports.0, ports.1, &secret)
-        .map_err(IpcError::from)?
-        .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::NoSubscription)))?;
+        ?
+        .ok_or_else(|| AppError::new(ErrorCode::NoSubscription))?;
 
-    s.subs.write_config(&gen).map_err(IpcError::from)?;
-    s.kernel.reload_config().await.map_err(IpcError::from)?;
+    s.subs.write_config(&gen)?;
+    s.kernel.reload_config().await?;
 
     s.emit(
         "subscription:applied",
@@ -159,21 +175,32 @@ pub async fn subscription_apply(state: State<'_, AppHandleState>) -> R<OpResultD
     )))
 }
 
-/// 预览生成的配置（排障用，前端"查看当前配置"）
 #[tauri::command]
-pub async fn subscription_preview_config(state: State<'_, AppHandleState>) -> R<String> {
-    let s = st(&state);
+pub async fn subscription_apply(state: State<'_, AppHandleState>) -> R<OpResultDto> {
+    subscription_apply_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 预览生成的配置（排障用，前端"查看当前配置"）
+pub async fn subscription_preview_config_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<String> {
+    
     let ports = s.kernel.actual_ports().unwrap_or((10801, 49152));
     let secret = s.secret.read().clone();
     let gen = s
         .subs
         .build_config(ports.0, ports.1, &secret)
-        .map_err(IpcError::from)?;
+        ?;
     match gen {
         Some(g) => Ok(g.yaml),
         None => Ok(String::new()),
     }
 }
+
+#[tauri::command]
+pub async fn subscription_preview_config(state: State<'_, AppHandleState>) -> R<String> {
+    subscription_preview_config_inner(&state.0).await.map_err(IpcError::from)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -181,7 +208,7 @@ mod tests {
     // 这里仅验证错误码传递不变形。
 
     use crate::commands::dto::IpcError;
-    use crate::domain::errors::{AppError, ErrorCode};
+    use crate::domain::errors::{AppError, AppResult, ErrorCode};
 
     #[test]
     fn ipc_error_preserves_code() {

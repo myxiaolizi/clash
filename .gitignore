@@ -8,6 +8,13 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# ---- WinUI 客户端（C#）----
+gui/bin/
+gui/obj/
+gui/*.user
+# 打包产物不进库（体积大，走 Release 附件分发）
+dist/
+
 # ---- 构建与日志产物 ----
 cargo-check.log
 *.log

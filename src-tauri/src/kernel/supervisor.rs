@@ -405,8 +405,24 @@ impl KernelSupervisor {
     async fn kill_child(&self) {
         let taken = self.child.lock().take();
         if let Some(mut child) = taken {
-            // 先温和尝试
+            let pid = child.id();
+
+            // 先温和尝试：直接杀进程树，避免 mihomo fork 出的子进程变孤儿。
+            // 只用 child.start_kill() 是不够的 —— 那只会结束父进程，
+            // 子进程会被孤儿化并在后台继续占端口（曾经泄漏 14 个 mihomo 进程）。
+            #[cfg(windows)]
+            if let Some(pid) = pid {
+                // /T 连带子进程树，/F 强制
+                let _ = tokio::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            }
+
             let _ = child.start_kill();
+
             match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
                 Ok(_) => {}
                 Err(_) => {

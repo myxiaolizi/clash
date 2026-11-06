@@ -6,22 +6,17 @@ use tauri::State;
 
 use crate::commands::dto::*;
 use crate::commands::state::AppHandleState;
-use crate::domain::errors::{AppError, ErrorCode};
+use crate::domain::errors::{AppError, AppResult, ErrorCode};
 use crate::domain::model::SwitchReason;
 
 type R<T> = Result<T, IpcError>;
 
-fn st<'a>(s: &'a State<'_, AppHandleState>) -> &'a Arc<crate::commands::state::AppState> {
-    &s.0
-}
-
 /// 列出可切换组及其节点（含最近测速结果）
-#[tauri::command]
-pub async fn node_groups(state: State<'_, AppHandleState>) -> R<Vec<GroupDto>> {
-    let s = st(&state);
-    let api = s.require_api().map_err(IpcError::from)?;
+pub async fn node_groups_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<Vec<GroupDto>> {
+    
+    let api = s.require_api()?;
     let groups = api.proxies_selectable().await.map_err(|e| {
-        IpcError::from(AppError::from(e))
+        AppError::from(e)
     })?;
 
     let last = s.speedtest.read().as_ref().and_then(|e| e.last_run());
@@ -75,31 +70,32 @@ pub async fn node_groups(state: State<'_, AppHandleState>) -> R<Vec<GroupDto>> {
     Ok(out)
 }
 
-/// 手动选择节点
 #[tauri::command]
-pub async fn node_select(
-    state: State<'_, AppHandleState>,
-    group: String,
-    node: String,
-) -> R<OpResultDto> {
-    let s = st(&state);
-    let api = s.require_api().map_err(IpcError::from)?;
+pub async fn node_groups(state: State<'_, AppHandleState>) -> R<Vec<GroupDto>> {
+    node_groups_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 手动选择节点
+pub async fn node_select_inner(s: &Arc<crate::commands::state::AppState>, group: String, node: String) -> AppResult<OpResultDto> {
+    
+    let api = s.require_api()?;
 
     // 先确认组与节点都存在，避免把 404 暴露成"成功"
     let info = api.proxy_group(&group).await.map_err(|e| match e {
         crate::domain::model::ApiError::NotFound(_) => {
-            IpcError::from(AppError::new(ErrorCode::SwitchGroupMissing))
+            AppError::new(ErrorCode::SwitchGroupMissing)
         }
-        other => IpcError::from(AppError::from(other)),
+        other => AppError::from(other),
     })?;
 
     if !info.all.iter().any(|n| n == &node) {
-        return Err(IpcError::from(AppError::new(ErrorCode::SwitchNodeMissing)));
+        return Err(AppError::new(ErrorCode::SwitchNodeMissing));
     }
 
     api.set_group_selected(&group, &node)
         .await
-        .map_err(|e| IpcError::from(AppError::from(e)))?;
+        .map_err(AppError::from)?;
 
     // 记录手动覆盖，暂停该组自动切换
     let policy = s.settings.get().switch_policy;
@@ -130,21 +126,26 @@ pub async fn node_select(
     Ok(OpResultDto::ok(format!("已切换到 {node}")))
 }
 
-/// 触发一次测速
 #[tauri::command]
-pub async fn speedtest_run(state: State<'_, AppHandleState>) -> R<SpeedtestStatusDto> {
-    let s = st(&state);
-    let engine = s.require_speedtest().map_err(IpcError::from)?;
+pub async fn node_select(state: State<'_, AppHandleState>, group: String, node: String) -> R<OpResultDto> {
+    node_select_inner(&state.0, group, node).await.map_err(IpcError::from)
+}
+
+
+/// 触发一次测速
+pub async fn speedtest_run_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<SpeedtestStatusDto> {
+    
+    let engine = s.require_speedtest()?;
 
     if engine.is_running() {
-        return Err(IpcError::from(AppError::new(ErrorCode::SpeedtestRunning)));
+        return Err(AppError::new(ErrorCode::SpeedtestRunning));
     }
 
     s.emit("speedtest:started", serde_json::json!({}));
     let run = engine
         .run(crate::domain::model::SpeedtestTrigger::Manual)
         .await
-        .map_err(IpcError::from)?;
+        ?;
 
     let status = SpeedtestStatusDto {
         running: false,
@@ -165,8 +166,13 @@ pub async fn speedtest_run(state: State<'_, AppHandleState>) -> R<SpeedtestStatu
 }
 
 #[tauri::command]
-pub async fn speedtest_status(state: State<'_, AppHandleState>) -> R<SpeedtestStatusDto> {
-    let s = st(&state);
+pub async fn speedtest_run(state: State<'_, AppHandleState>) -> R<SpeedtestStatusDto> {
+    speedtest_run_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+pub async fn speedtest_status_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<SpeedtestStatusDto> {
+    
     let engine = match s.speedtest.read().clone() {
         Some(e) => e,
         None => {
@@ -209,10 +215,15 @@ pub async fn speedtest_status(state: State<'_, AppHandleState>) -> R<SpeedtestSt
     })
 }
 
-/// 依据最近测速结果立即执行一次自动切换判定
 #[tauri::command]
-pub async fn switch_auto_apply(state: State<'_, AppHandleState>) -> R<Vec<SwitchRecordDto>> {
-    let s = Arc::clone(&state.0);
+pub async fn speedtest_status(state: State<'_, AppHandleState>) -> R<SpeedtestStatusDto> {
+    speedtest_status_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 依据最近测速结果立即执行一次自动切换判定
+pub async fn switch_auto_apply_inner(s: &Arc<crate::commands::state::AppState>) -> AppResult<Vec<SwitchRecordDto>> {
+    let s = Arc::clone(s);
 
     // 关键：先取出 Arc 并丢弃所有 parking_lot 守卫，再进入 await。
     // `parking_lot::RwLockReadGuard` 不是 Send，跨 await 会让整个 future 不 Send，
@@ -221,7 +232,7 @@ pub async fn switch_auto_apply(state: State<'_, AppHandleState>) -> R<Vec<Switch
         let guard = s.speedtest.read();
         guard.clone()
     }
-    .ok_or_else(|| IpcError::from(AppError::new(ErrorCode::CoreNotRunning)))?;
+    .ok_or_else(|| AppError::new(ErrorCode::CoreNotRunning))?;
 
     let settings = s.settings.get();
 
@@ -232,7 +243,7 @@ pub async fn switch_auto_apply(state: State<'_, AppHandleState>) -> R<Vec<Switch
             settings.speedtest_timeout_ms,
         )
         .await
-        .map_err(IpcError::from)?;
+        ?;
 
     let dtos: Vec<SwitchRecordDto> = records.iter().map(SwitchRecordDto::from).collect();
     if !dtos.is_empty() {
@@ -244,10 +255,15 @@ pub async fn switch_auto_apply(state: State<'_, AppHandleState>) -> R<Vec<Switch
     Ok(dtos)
 }
 
-/// 手动切换历史
 #[tauri::command]
-pub async fn switch_history(state: State<'_, AppHandleState>, limit: Option<usize>) -> R<Vec<SwitchRecordDto>> {
-    let s = st(&state);
+pub async fn switch_auto_apply(state: State<'_, AppHandleState>) -> R<Vec<SwitchRecordDto>> {
+    switch_auto_apply_inner(&state.0).await.map_err(IpcError::from)
+}
+
+
+/// 手动切换历史
+pub async fn switch_history_inner(s: &Arc<crate::commands::state::AppState>, limit: Option<usize>) -> AppResult<Vec<SwitchRecordDto>> {
+    
     Ok(s.history
         .recent(limit.unwrap_or(50).min(200))
         .iter()
@@ -255,27 +271,28 @@ pub async fn switch_history(state: State<'_, AppHandleState>, limit: Option<usiz
         .collect())
 }
 
-/// 直接指定节点并记录为手动切换（供托盘快捷切换）
 #[tauri::command]
-pub async fn switch_manual(
-    state: State<'_, AppHandleState>,
-    group: String,
-    node: String,
-) -> R<SwitchRecordDto> {
-    let s = st(&state);
-    let api = s.require_api().map_err(IpcError::from)?;
+pub async fn switch_history(state: State<'_, AppHandleState>, limit: Option<usize>) -> R<Vec<SwitchRecordDto>> {
+    switch_history_inner(&state.0, limit).await.map_err(IpcError::from)
+}
+
+
+/// 直接指定节点并记录为手动切换（供托盘快捷切换）
+pub async fn switch_manual_inner(s: &Arc<crate::commands::state::AppState>, group: String, node: String) -> AppResult<SwitchRecordDto> {
+    
+    let api = s.require_api()?;
 
     let info = api.proxy_group(&group).await.map_err(|e| match e {
         crate::domain::model::ApiError::NotFound(_) => {
-            IpcError::from(AppError::new(ErrorCode::SwitchGroupMissing))
+            AppError::new(ErrorCode::SwitchGroupMissing)
         }
-        other => IpcError::from(AppError::from(other)),
+        other => AppError::from(other),
     })?;
 
     let from = info.now.clone();
     api.set_group_selected(&group, &node)
         .await
-        .map_err(|e| IpcError::from(AppError::from(e)))?;
+        .map_err(AppError::from)?;
 
     let policy = s.settings.get().switch_policy;
     if let Some(engine) = s.speedtest.read().clone() {
@@ -301,17 +318,28 @@ pub async fn switch_manual(
     Ok(SwitchRecordDto::from(&rec))
 }
 
-/// 只读：当前组的 API 原始 kind（排障时确认是否为 Selector）
 #[tauri::command]
-pub async fn node_group_raw_kind(state: State<'_, AppHandleState>, group: String) -> R<String> {
-    let s = st(&state);
-    let api = s.require_api().map_err(IpcError::from)?;
+pub async fn switch_manual(state: State<'_, AppHandleState>, group: String, node: String) -> R<SwitchRecordDto> {
+    switch_manual_inner(&state.0, group, node).await.map_err(IpcError::from)
+}
+
+
+/// 只读：当前组的 API 原始 kind（排障时确认是否为 Selector）
+pub async fn node_group_raw_kind_inner(s: &Arc<crate::commands::state::AppState>, group: String) -> AppResult<String> {
+    
+    let api = s.require_api()?;
     let info = api
         .proxy_group(&group)
         .await
-        .map_err(|e| IpcError::from(AppError::from(e)))?;
+        .map_err(AppError::from)?;
     Ok(info.kind)
 }
+
+#[tauri::command]
+pub async fn node_group_raw_kind(state: State<'_, AppHandleState>, group: String) -> R<String> {
+    node_group_raw_kind_inner(&state.0, group).await.map_err(IpcError::from)
+}
+
 
 #[cfg(test)]
 mod tests {
